@@ -1382,7 +1382,12 @@ final class PiPStream: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 let filter = SCContentFilter(desktopIndependentWindow: window)
                 let config = SCStreamConfiguration()
-                let scale = CGFloat(filter.pointPixelScale)
+                let scale: CGFloat
+                if #available(macOS 14.0, *) {
+                    scale = CGFloat(filter.pointPixelScale)
+                } else {
+                    scale = await MainActor.run { NSScreen.main?.backingScaleFactor ?? 2.0 }
+                }
                 // Plenty for a PiP; bounded so a huge window doesn't stream 5K frames.
                 let fit = min(1, 1600 / max(window.frame.width * scale, 1))
                 config.width = max(2, Int(window.frame.width * scale * fit))
@@ -3190,7 +3195,6 @@ func clickMouseNonDisruptive(at targetPoint: CGPoint?, button: CGMouseButton = .
         if AXUIElementCopyElementAtPosition(appEl, Float(pt.x), Float(pt.y), &hitEl) == .success, let leaf = hitEl {
             // Walk up at most 4 levels to find an explicit interactive control; NEVER fall back to AXWindow or AXWebArea!
             var matchedControl: AXUIElement? = nil
-            var matchedRole: String = ""
             var curr: AXUIElement = leaf
             for _ in 0..<5 {
                 let r = getAttribute(curr, kAXRoleAttribute) as? String ?? ""
@@ -3199,7 +3203,6 @@ func clickMouseNonDisruptive(at targetPoint: CGPoint?, button: CGMouseButton = .
                 }
                 if pressableRoles.contains(r) || focusableRoles.contains(r) {
                     matchedControl = curr
-                    matchedRole = r
                     break
                 }
                 if let parent = getAttribute(curr, kAXParentAttribute) {
