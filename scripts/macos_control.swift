@@ -36,6 +36,234 @@ let kMCURootDirectory: String = {
 let kDefaultConfigPath = kMCURootDirectory + "/config/access_control.json"
 let kDefaultAuditLogPath = kMCURootDirectory + "/logs/audit.jsonl"
 let kDefaultKillSwitchPath = "/tmp/mcu_kill.lock"
+let kCursorDaemonPIDPath = "/tmp/mcu_cursor_daemon.pid"
+
+var isMCPServerMode = false
+var isCursorDaemonProcess = false
+var autoPiPDepth = 0
+
+func emitOutput(_ text: String) {
+    if isMCPServerMode {
+        FileHandle.standardError.write((text + "\n").data(using: .utf8) ?? Data())
+    } else {
+        print(text)
+    }
+}
+
+/// Decodes a CGImage into an eager in-memory RGBA bitmap so deleting the backing file in `defer` never leaves Vision/CoreGraphics with an unreadable lazy image.
+func loadMaterializedCGImage(fromFile path: String) -> CGImage? {
+    guard FileManager.default.fileExists(atPath: path),
+          let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+          let cgImg = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+        return nil
+    }
+    let width = cgImg.width
+    let height = cgImg.height
+    guard width > 0, height > 0,
+          let ctx = CGContext(
+              data: nil,
+              width: width,
+              height: height,
+              bitsPerComponent: 8,
+              bytesPerRow: 0,
+              space: CGColorSpaceCreateDeviceRGB(),
+              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+          ) else {
+        return cgImg
+    }
+    ctx.draw(cgImg, in: CGRect(x: 0, y: 0, width: width, height: height))
+    return ctx.makeImage() ?? cgImg
+}
+
+/// Resolves a running application strictly matching exact names first, then substring matches, prioritizing GUI (.regular) apps over helper processes.
+func findRunningApplication(matching name: String) -> NSRunningApplication? {
+    let query = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !query.isEmpty else { return nil }
+    let apps = NSWorkspace.shared.runningApplications.filter { !$0.isTerminated }
+    let regular = apps.filter { $0.activationPolicy == .regular }
+    let other = apps.filter { $0.activationPolicy != .regular }
+
+    func bundleName(of app: NSRunningApplication) -> String? {
+        app.bundleURL?.deletingPathExtension().lastPathComponent
+    }
+    func execName(of app: NSRunningApplication) -> String? {
+        app.executableURL?.lastPathComponent
+    }
+
+    for pool in [regular, other] {
+        if let exact = pool.first(where: { $0.localizedName?.caseInsensitiveCompare(query) == .orderedSame }) {
+            return exact
+        }
+        if let exactBundle = pool.first(where: {
+            bundleName(of: $0)?.caseInsensitiveCompare(query) == .orderedSame ||
+            execName(of: $0)?.caseInsensitiveCompare(query) == .orderedSame ||
+            $0.bundleIdentifier?.caseInsensitiveCompare(query) == .orderedSame
+        }) {
+            return exactBundle
+        }
+    }
+    for pool in [regular, other] {
+        if let partial = pool.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(query) == true }) {
+            return partial
+        }
+        if let partialBundle = pool.first(where: {
+            bundleName(of: $0)?.localizedCaseInsensitiveContains(query) == true ||
+            execName(of: $0)?.localizedCaseInsensitiveContains(query) == true ||
+            $0.bundleIdentifier?.localizedCaseInsensitiveContains(query) == true
+        }) {
+            return partialBundle
+        }
+    }
+    return nil
+}
+
+func cursorDaemonPID() -> pid_t? {
+    guard let s = try? String(contentsOfFile: kCursorDaemonPIDPath, encoding: .utf8),
+          let p = Int32(s.trimmingCharacters(in: .whitespacesAndNewlines)),
+          p > 1, kill(p, 0) == 0 else {
+        return nil
+    }
+    return p
+}
+
+func firstWindowID(matchingPID pid: pid_t) -> CGWindowID? {
+    let wins = getWindowsList(allLayers: false)
+    if let widStr = try? String(contentsOfFile: "/tmp/mcu_active_pip_wid.txt", encoding: .utf8),
+       let wid = Int(widStr.trimmingCharacters(in: .whitespacesAndNewlines)),
+       wins.contains(where: {
+           let wPid = ($0["pid"] as? Int).map(pid_t.init) ?? ($0["pid"] as? pid_t)
+           return ($0["id"] as? Int) == wid && wPid == pid
+       }) {
+        return CGWindowID(wid)
+    }
+    let daemonPID = cursorDaemonPID()
+    let owned = wins.filter { win in
+        let wPid = (win["pid"] as? Int).map(pid_t.init) ?? (win["pid"] as? pid_t)
+        return wPid == pid && wPid != daemonPID
+    }
+    if let sizeable = owned.first(where: { win in
+        let b = win["bounds"] as? [String: CGFloat]
+        return (b?["width"] ?? 0) >= 200 && (b?["height"] ?? 0) >= 150
+    }), let id = sizeable["id"] as? Int {
+        return CGWindowID(id)
+    }
+    if let first = owned.first, let id = first["id"] as? Int {
+        return CGWindowID(id)
+    }
+    return nil
+}
+
+func windowID(at point: CGPoint) -> CGWindowID? {
+    let myPID = ProcessInfo.processInfo.processIdentifier
+    let daemonPID = cursorDaemonPID()
+    for win in getWindowsList(allLayers: false) {
+        let wPid = (win["pid"] as? Int).map(pid_t.init) ?? (win["pid"] as? pid_t)
+        if wPid == myPID || wPid == daemonPID { continue }
+        guard let b = win["bounds"] as? [String: CGFloat],
+              let id = win["id"] as? Int else { continue }
+        let w = b["width"] ?? 0
+        let h = b["height"] ?? 0
+        if w < 50 || h < 50 { continue }
+        let rect = CGRect(x: b["x"] ?? 0, y: b["y"] ?? 0, width: w, height: h)
+        if rect.contains(point) {
+            return CGWindowID(id)
+        }
+    }
+    return nil
+}
+
+/// Resolves an explicit target (`--app`, `--window`, `--pid`) without falling back silently to another app/window.
+func resolveExplicitTarget(appName: String? = nil, windowID: CGWindowID? = nil, pid: pid_t? = nil, requireWindow: Bool = false) -> (pid: pid_t?, windowID: CGWindowID?, error: String?) {
+    if let p = pid {
+        let alive = NSRunningApplication(processIdentifier: p) != nil || kill(p, 0) == 0
+        guard alive else {
+            return (nil, nil, "Error: No running process found with PID \(p)")
+        }
+        let wid = windowID ?? firstWindowID(matchingPID: p)
+        if requireWindow && wid == nil {
+            return (p, nil, "Error: No visible window found for PID \(p)")
+        }
+        return (p, wid, nil)
+    }
+
+    if let wid = windowID {
+        let wins = getWindowsList(allLayers: true)
+        guard let win = wins.first(where: { ($0["id"] as? Int) == Int(wid) }) else {
+            return (nil, nil, "Error: Window ID \(wid) not found")
+        }
+        let wPid = (win["pid"] as? Int).map(pid_t.init) ?? (win["pid"] as? pid_t)
+        return (wPid, wid, nil)
+    }
+
+    if let app = appName {
+        let wid = PiPWindowController.firstWindowID(matchingApp: app)
+        let matchedApp = findRunningApplication(matching: app)
+        var resolvedPID = matchedApp?.processIdentifier
+        if resolvedPID == nil, let w = wid {
+            let wins = getWindowsList(allLayers: false)
+            if let win = wins.first(where: { ($0["id"] as? Int) == Int(w) }) {
+                resolvedPID = (win["pid"] as? Int).map(pid_t.init) ?? (win["pid"] as? pid_t)
+            }
+        }
+        if wid == nil && resolvedPID == nil {
+            return (nil, nil, "Error: Could not locate running application '\(app)'")
+        }
+        if requireWindow && wid == nil {
+            return (resolvedPID, nil, "Error: Could not find a visible window for application '\(app)'")
+        }
+        return (resolvedPID, wid, nil)
+    }
+
+    return (nil, nil, nil)
+}
+
+/// Ensures PiP live preview is shown before a mouse operation and exited automatically once it completes inside mcu.
+@discardableResult
+func withAutoPiP<T>(
+    windowID wid: CGWindowID? = nil,
+    appName: String? = nil,
+    pid: pid_t? = nil,
+    point: CGPoint? = nil,
+    action: () -> T
+) -> T {
+    if autoPiPDepth > 0 || !VirtualCursorClient.isEnabled || isCursorDaemonProcess {
+        return action()
+    }
+    autoPiPDepth += 1
+    defer { autoPiPDepth -= 1 }
+
+    var resolvedWID = wid
+    if resolvedWID == nil, let app = appName {
+        resolvedWID = PiPWindowController.firstWindowID(matchingApp: app)
+    }
+    if resolvedWID == nil, let p = pid {
+        resolvedWID = firstWindowID(matchingPID: p)
+    }
+    if resolvedWID == nil, let pt = point {
+        resolvedWID = windowID(at: pt)
+    }
+    if resolvedWID == nil, pid == nil, appName == nil {
+        if let lastPID = resolveLastTargetPID(explicitPID: nil) {
+            resolvedWID = firstWindowID(matchingPID: lastPID)
+        }
+        if resolvedWID == nil {
+            resolvedWID = windowID(at: getMousePosition())
+        }
+    }
+
+    guard let activeWID = resolvedWID else {
+        return action()
+    }
+
+    VirtualCursorClient.pipShow(appName: appName, windowID: Int(activeWID))
+    usleep(220_000)
+    defer {
+        usleep(250_000)
+        VirtualCursorClient.pipHide(windowID: Int(activeWID))
+        usleep(380_000)
+    }
+    return action()
+}
 
 // MARK: - Keycode Mappings
 
@@ -256,26 +484,33 @@ struct VirtualCursorClient {
     }
     
     static func ensureDaemonRunning() {
-        guard isEnabled else { return }
-        // Check if running via pgrep or test file
+        guard isEnabled, !isCursorDaemonProcess else { return }
+        if cursorDaemonPID() != nil { return }
+
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        task.arguments = ["-f", "mcu cursor-daemon"]
+        task.arguments = ["-f", "cursor-daemon"]
         let pipe = Pipe()
         task.standardOutput = pipe
         try? task.run()
         task.waitUntilExit()
         let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        
+
         if out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            // Spawn background cursor daemon
-            let binPath = CommandLine.arguments[0]
+            let binPath = Bundle.main.executableURL?.path ?? CommandLine.arguments[0]
             let daemonTask = Process()
             daemonTask.executableURL = URL(fileURLWithPath: binPath)
             daemonTask.arguments = ["cursor-daemon"]
             try? daemonTask.run()
-            // Give the fresh daemon time to register its notification observer, or the first message is lost.
-            usleep(700000)
+            // Wait up to 1.5s for daemon PID file / notification registration
+            for _ in 0..<30 {
+                if cursorDaemonPID() != nil {
+                    usleep(120_000)
+                    return
+                }
+                usleep(50_000)
+            }
+            usleep(300_000)
         }
     }
     
@@ -322,10 +557,8 @@ struct VirtualCursorClient {
                let p = (win["pid"] as? Int) ?? (win["pid"] as? Int32).map(Int.init) {
                 resolvedTargetPID = pid_t(p)
             }
-        } else if let a = appName {
-            if let match = NSWorkspace.shared.runningApplications.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(a) == true }) {
-                resolvedTargetPID = match.processIdentifier
-            }
+        } else if let a = appName, let match = findRunningApplication(matching: a) {
+            resolvedTargetPID = match.processIdentifier
         }
         if let tp = resolvedTargetPID {
             try? "\(tp)".write(toFile: "/tmp/mcu_active_pip_pid.txt", atomically: true, encoding: .utf8)
@@ -365,7 +598,13 @@ struct VirtualCursorClient {
     }
     
     static func pipHide(windowID: Int? = nil) {
-        if windowID == nil {
+        if let wid = windowID {
+            if let saved = try? String(contentsOfFile: "/tmp/mcu_active_pip_wid.txt", encoding: .utf8),
+               Int(saved.trimmingCharacters(in: .whitespacesAndNewlines)) == wid {
+                try? FileManager.default.removeItem(atPath: "/tmp/mcu_active_pip_pid.txt")
+                try? FileManager.default.removeItem(atPath: "/tmp/mcu_active_pip_wid.txt")
+            }
+        } else {
             try? FileManager.default.removeItem(atPath: "/tmp/mcu_active_pip_pid.txt")
             try? FileManager.default.removeItem(atPath: "/tmp/mcu_active_pip_wid.txt")
         }
@@ -1832,7 +2071,7 @@ final class PiPWindowController: PiPInteractionDelegate {
         snapTimer?.invalidate()
         manager?.didHide(self)
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.25
+            ctx.duration = 0.16
             panel.animator().alphaValue = 0
         }, completionHandler: {
             panel.orderOut(nil)
@@ -2204,16 +2443,40 @@ final class PiPWindowController: PiPInteractionDelegate {
         task.arguments = ["-x", "-o", "-l\(windowID)", path]
         guard (try? task.run()) != nil else { return nil }
         task.waitUntilExit()
-        guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
-        return CGImageSourceCreateImageAtIndex(source, 0, nil)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        return loadMaterializedCGImage(fromFile: path)
     }
 
     static func firstWindowID(matchingApp name: String) -> CGWindowID? {
-        for window in getWindowsList(allLayers: false) {
-            let owner = window["app"] as? String ?? ""
-            if owner.localizedCaseInsensitiveContains(name), let id = window["id"] as? Int {
+        let query = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return nil }
+        let wins = getWindowsList(allLayers: false)
+
+        func pickBest(from subset: [[String: Any]]) -> CGWindowID? {
+            if let sizeable = subset.first(where: {
+                let b = $0["bounds"] as? [String: CGFloat]
+                return (b?["width"] ?? 0) >= 200 && (b?["height"] ?? 0) >= 150
+            }), let id = sizeable["id"] as? Int {
                 return CGWindowID(id)
             }
+            if let first = subset.first, let id = first["id"] as? Int {
+                return CGWindowID(id)
+            }
+            return nil
+        }
+
+        let exact = wins.filter { ($0["app"] as? String ?? "").caseInsensitiveCompare(query) == .orderedSame }
+        if let id = pickBest(from: exact) { return id }
+
+        let partial = wins.filter { ($0["app"] as? String ?? "").localizedCaseInsensitiveContains(query) }
+        if let id = pickBest(from: partial) { return id }
+
+        if let matchedApp = findRunningApplication(matching: query) {
+            let pidWins = wins.filter {
+                let wPid = ($0["pid"] as? Int).map(pid_t.init) ?? ($0["pid"] as? pid_t)
+                return wPid == matchedApp.processIdentifier
+            }
+            if let id = pickBest(from: pidWins) { return id }
         }
         return nil
     }
@@ -2281,6 +2544,8 @@ class FancyCursorDaemon {
     var tipOffsetY: CGFloat { assetMargin + tipInAssetY } // ~17.60 pt
     
     func start() {
+        isCursorDaemonProcess = true
+        try? "\(ProcessInfo.processInfo.processIdentifier)".write(toFile: kCursorDaemonPIDPath, atomically: true, encoding: .utf8)
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         
@@ -2377,7 +2642,7 @@ class FancyCursorDaemon {
                   let info = notif.userInfo as? [String: Any],
                   let action = info["action"] as? String else { return }
             
-            if action != "done" {
+            if action != "done" && action != "pip_hide" {
                 self.resetIdleTimer()
             }
             
@@ -2444,6 +2709,7 @@ class FancyCursorDaemon {
                 }
             case "stop":
                 self.pipManager?.hideAll()
+                try? FileManager.default.removeItem(atPath: kCursorDaemonPIDPath)
                 exit(0)
             default:
                 break
@@ -2644,7 +2910,8 @@ func getScreenInfoJSON() -> String {
     return "{}"
 }
 
-func captureScreen(output: String, scale1x: Bool, withGrid: Bool, windowID: CGWindowID?, rect: CGRect?, includeCursor: Bool) {
+@discardableResult
+func captureScreen(output: String, scale1x: Bool, withGrid: Bool, windowID: CGWindowID?, rect: CGRect?, includeCursor: Bool) -> (success: Bool, message: String) {
     let tmpFile = "/tmp/mcu_raw_capture_\(ProcessInfo.processInfo.processIdentifier).png"
     var args = ["-x"]
     if includeCursor { args.append("-C") }
@@ -2656,33 +2923,48 @@ func captureScreen(output: String, scale1x: Bool, withGrid: Bool, windowID: CGWi
         args.append("-m")
     }
     args.append(tmpFile)
-    
+
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
     task.arguments = args
-    try? task.run()
-    task.waitUntilExit()
-    
-    defer { try? FileManager.default.removeItem(atPath: tmpFile) }
-    
-    guard FileManager.default.fileExists(atPath: tmpFile),
-          let imgSource = CGImageSourceCreateWithURL(URL(fileURLWithPath: tmpFile) as CFURL, nil),
-          let rawImg = CGImageSourceCreateImageAtIndex(imgSource, 0, nil) else {
-        fputs("Error: screencapture failed to generate image\n", stderr)
-        exit(1)
+    do {
+        try task.run()
+    } catch {
+        let msg = "Error: failed to launch screencapture: \(error.localizedDescription)"
+        fputs(msg + "\n", stderr)
+        return (false, msg)
     }
-    
+    task.waitUntilExit()
+
+    defer { try? FileManager.default.removeItem(atPath: tmpFile) }
+
+    guard task.terminationStatus == 0,
+          FileManager.default.fileExists(atPath: tmpFile),
+          let rawImg = loadMaterializedCGImage(fromFile: tmpFile) else {
+        let targetDesc = windowID.map { "window \($0)" } ?? "screen"
+        let msg = "Error: screen capture failed for \(targetDesc). Check Screen Recording permissions and ensure the target window still exists, then retry."
+        fputs(msg + "\n", stderr)
+        return (false, msg)
+    }
+
     let scale = NSScreen.main?.backingScaleFactor ?? 2.0
     let targetWidth = scale1x ? Int(Double(rawImg.width) / scale) : rawImg.width
     let targetHeight = scale1x ? Int(Double(rawImg.height) / scale) : rawImg.height
-    
+
     if !scale1x && !withGrid {
-        try? FileManager.default.removeItem(atPath: output)
-        try? FileManager.default.copyItem(atPath: tmpFile, toPath: output)
-        print("Captured screenshot directly: \(output) (\(rawImg.width)x\(rawImg.height)px)")
-        return
+        do {
+            try? FileManager.default.removeItem(atPath: output)
+            try FileManager.default.copyItem(atPath: tmpFile, toPath: output)
+            let msg = "Captured screenshot directly: \(output) (\(rawImg.width)x\(rawImg.height)px)"
+            emitOutput(msg)
+            return (true, msg)
+        } catch {
+            let msg = "Error: failed to save screenshot to \(output): \(error.localizedDescription)"
+            fputs(msg + "\n", stderr)
+            return (false, msg)
+        }
     }
-    
+
     let colorSpace = CGColorSpaceCreateDeviceRGB()
     guard let context = CGContext(
         data: nil,
@@ -2693,8 +2975,9 @@ func captureScreen(output: String, scale1x: Bool, withGrid: Bool, windowID: CGWi
         space: colorSpace,
         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
     ) else {
-        fputs("Error: Failed to create CoreGraphics context\n", stderr)
-        exit(1)
+        let msg = "Error: Failed to create CoreGraphics context"
+        fputs(msg + "\n", stderr)
+        return (false, msg)
     }
     
     context.interpolationQuality = .high
@@ -2775,18 +3058,26 @@ func captureScreen(output: String, scale1x: Bool, withGrid: Bool, windowID: CGWi
     }
     
     guard let outputImg = context.makeImage() else {
-        fputs("Error: Failed to finalize CoreGraphics image\n", stderr)
-        exit(1)
+        let msg = "Error: Failed to finalize CoreGraphics image"
+        fputs(msg + "\n", stderr)
+        return (false, msg)
     }
-    
+
     let destURL = URL(fileURLWithPath: output) as CFURL
     guard let dest = CGImageDestinationCreateWithURL(destURL, "public.png" as CFString, 1, nil) else {
-        fputs("Error: Failed to create image destination for \(output)\n", stderr)
-        exit(1)
+        let msg = "Error: Failed to create image destination for \(output)"
+        fputs(msg + "\n", stderr)
+        return (false, msg)
     }
     CGImageDestinationAddImage(dest, outputImg, nil)
-    CGImageDestinationFinalize(dest)
-    print("Screenshot saved to \(output) (\(targetWidth)x\(targetHeight) \(scale1x ? "points 1:1" : "pixels"))")
+    guard CGImageDestinationFinalize(dest) else {
+        let msg = "Error: Failed to write PNG screenshot to \(output)"
+        fputs(msg + "\n", stderr)
+        return (false, msg)
+    }
+    let msg = "Screenshot saved to \(output) (\(targetWidth)x\(targetHeight) \(scale1x ? "points 1:1" : "pixels"))"
+    emitOutput(msg)
+    return (true, msg)
 }
 
 // MARK: - Window Inspection & Management
@@ -2847,24 +3138,22 @@ func focusTarget(_ query: String) -> Bool {
         return true
     }
     // 2. Try App Name
-    let runningApps = NSWorkspace.shared.runningApplications
-    for app in runningApps {
-        if let name = app.localizedName, name.localizedCaseInsensitiveContains(query) {
-            app.activate()
-            AccessControlEngine.logAudit(action: "window_focus", targetApp: name, details: "PID \(app.processIdentifier)")
-            print("Focused app '\(name)' (PID: \(app.processIdentifier))")
-            return true
-        }
+    if let app = findRunningApplication(matching: query) {
+        let name = app.localizedName ?? query
+        app.activate()
+        AccessControlEngine.logAudit(action: "window_focus", targetApp: name, details: "PID \(app.processIdentifier)")
+        emitOutput("Focused app '\(name)' (PID: \(app.processIdentifier))")
+        return true
     }
     // 3. Try Window ID
     if let wid = Int(query) {
         let windows = getWindowsList(allLayers: true)
         if let win = windows.first(where: { ($0["id"] as? Int) == wid }),
-           let pid = win["pid"] as? Int32,
+           let pid = (win["pid"] as? Int).map(Int32.init) ?? (win["pid"] as? Int32),
            let app = NSRunningApplication(processIdentifier: pid) {
             app.activate()
             AccessControlEngine.logAudit(action: "window_focus", targetApp: win["app"] as? String, details: "Window ID \(wid)")
-            print("Focused window [\(wid)] owned by \(win["app"] ?? "")")
+            emitOutput("Focused window [\(wid)] owned by \(win["app"] ?? "")")
             return true
         }
     }
@@ -2977,13 +3266,16 @@ func findAXElementsRecursively(_ el: AXUIElement, roleFilter: String?, titleFilt
 
 func getAppElement(appName: String?, pid: Int32?) -> AXUIElement? {
     if let p = pid {
+        guard NSRunningApplication(processIdentifier: p) != nil || kill(p, 0) == 0 else {
+            return nil
+        }
         return AXUIElementCreateApplication(p)
     }
     if let name = appName {
-        let apps = NSWorkspace.shared.runningApplications
-        if let target = apps.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(name) == true }) {
-            return AXUIElementCreateApplication(target.processIdentifier)
+        guard let target = findRunningApplication(matching: name) else {
+            return nil
         }
+        return AXUIElementCreateApplication(target.processIdentifier)
     }
     if let front = NSWorkspace.shared.frontmostApplication {
         return AXUIElementCreateApplication(front.processIdentifier)
@@ -3075,51 +3367,51 @@ func selectRangeInBackground(pid: pid_t, from: CGPoint, to: CGPoint) -> Bool {
     return false
 }
 
-func selectRangeAction(from: CGPoint, to: CGPoint, targetPID: pid_t? = nil, appName: String? = nil, autoClean: Bool = false) {
+@discardableResult
+func selectRangeAction(from: CGPoint, to: CGPoint, targetPID: pid_t? = nil, windowID: CGWindowID? = nil, appName: String? = nil, autoClean: Bool = false) -> String {
     var pid = targetPID
-    if pid == nil, let app = appName {
-        let apps = NSWorkspace.shared.runningApplications
-        if let match = apps.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(app) == true }) {
-            pid = match.processIdentifier
+    if pid == nil, let app = appName, let match = findRunningApplication(matching: app) {
+        pid = match.processIdentifier
+    }
+    if pid == nil {
+        pid = resolveTargetPID(at: from, explicitPID: nil)
+    }
+
+    withAutoPiP(windowID: windowID, appName: appName, pid: pid, point: from) {
+        // 1. Smooth glide to start point
+        VirtualCursorClient.move(to: from, speed: "normal")
+        usleep(250000)
+        VirtualCursorClient.click(at: from)
+
+        // 2. Drag to end point
+        VirtualCursorClient.move(to: to, speed: "normal")
+        usleep(250000)
+        VirtualCursorClient.click(at: to)
+
+        // 3. Post non-disruptive events to background app or AX range
+        if let p = pid {
+            let axSuccess = selectRangeInBackground(pid: p, from: from, to: to)
+            if !axSuccess {
+                let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: from, mouseButton: .left)
+                down?.postToPid(p)
+                usleep(20000)
+                let drag = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: to, mouseButton: .left)
+                drag?.postToPid(p)
+                usleep(20000)
+                let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: to, mouseButton: .left)
+                up?.postToPid(p)
+            }
+        } else {
+            dragMouse(from: from, to: to, duration: 0.4, restoreCursor: true)
         }
     }
-    
-    if let app = appName {
-        VirtualCursorClient.pipShow(appName: app, windowID: nil)
-    }
-    
-    // 1. Smooth glide to start point
-    VirtualCursorClient.move(to: from, speed: "normal")
-    usleep(250000)
-    VirtualCursorClient.click(at: from)
-    
-    // 2. Drag to end point
-    VirtualCursorClient.move(to: to, speed: "normal")
-    usleep(250000)
-    VirtualCursorClient.click(at: to)
-    
-    // 3. Post non-disruptive events to background app or AX range
-    if let p = pid {
-        let axSuccess = selectRangeInBackground(pid: p, from: from, to: to)
-        if !axSuccess {
-            let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: from, mouseButton: .left)
-            down?.postToPid(p)
-            usleep(20000)
-            let drag = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: to, mouseButton: .left)
-            drag?.postToPid(p)
-            usleep(20000)
-            let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: to, mouseButton: .left)
-            up?.postToPid(p)
-        }
-    } else {
-        dragMouse(from: from, to: to, duration: 0.4, restoreCursor: true)
-    }
-    
+
     if autoClean {
-        usleep(300000)
         VirtualCursorClient.done()
     }
-    print("Selected range from (\(Int(from.x)), \(Int(from.y))) to (\(Int(to.x)), \(Int(to.y))) \(pid != nil ? "[Target PID: \(pid!)]" : "")")
+    let msg = "Selected range from (\(Int(from.x)), \(Int(from.y))) to (\(Int(to.x)), \(Int(to.y))) \(pid != nil ? "[Target PID: \(pid!)]" : "")"
+    emitOutput(msg)
+    return msg
 }
 
 func resolveTargetPID(at pt: CGPoint, explicitPID: pid_t?) -> pid_t? {
@@ -3149,179 +3441,232 @@ func resolveTargetPID(at pt: CGPoint, explicitPID: pid_t?) -> pid_t? {
     return nil
 }
 
-func clickMouseNonDisruptive(at targetPoint: CGPoint?, button: CGMouseButton = .left, clickCount: Int = 1, restoreCursor: Bool = true, targetPID: pid_t? = nil) {
+@discardableResult
+func clickMouseNonDisruptive(
+    at targetPoint: CGPoint?,
+    button: CGMouseButton = .left,
+    clickCount: Int = 1,
+    restoreCursor: Bool = true,
+    targetPID: pid_t? = nil,
+    windowID: CGWindowID? = nil,
+    appName: String? = nil
+) -> (success: Bool, message: String) {
     let pt = targetPoint ?? getMousePosition()
     let resolvedPID = resolveTargetPID(at: pt, explicitPID: targetPID)
-    
-    // Access Control check
+
+    // Access Control check before launching PiP
     let validation = AccessControlEngine.validate(action: "mouse_click", point: pt)
     if !validation.allowed {
         VirtualCursorClient.glow(color: "red")
         fputs("\(validation.reason)\n", stderr)
         AccessControlEngine.logAudit(action: "mouse_click", details: "Point (\(Int(pt.x)), \(Int(pt.y)))", decision: "BLOCKED", reason: validation.reason)
-        return
+        return (false, validation.reason)
     }
-    
-    // Glide our virtual cursor smoothly to the target point so movement is clearly visible!
-    if let target = targetPoint {
-        VirtualCursorClient.move(to: target, speed: "normal")
-        usleep(400000)
-    }
-    
-    let downType: CGEventType
-    let upType: CGEventType
-    switch button {
-    case .right:
-        downType = .rightMouseDown
-        upType = .rightMouseUp
-    case .center:
-        downType = .otherMouseDown
-        upType = .otherMouseUp
-    default:
-        downType = .leftMouseDown
-        upType = .leftMouseUp
-    }
-    
-    let focusableRoles: Set<String> = ["AXTextField", "AXComboBox", "AXTextArea", "AXSearchField"]
-    let pressableRoles: Set<String> = ["AXButton", "AXLink", "AXCheckBox", "AXRadioButton", "AXMenuItem", "AXPopUpButton", "AXTextField", "AXComboBox", "AXTextArea", "AXSearchField", "AXTabButton"]
-    let containerStopRoles: Set<String> = ["AXWindow", "AXApplication", "AXWebArea", "AXScrollArea", "AXSplitGroup", "AXToolbar", "AXSheet"]
-    
-    var handledViaAX = false
-    if let pid = resolvedPID, button == .left {
-        try? "\(pt.x),\(pt.y)".write(toFile: "/tmp/mcu_last_click_\(pid).txt", atomically: true, encoding: .utf8)
-        try? "\(pid)".write(toFile: "/tmp/mcu_last_target_pid.txt", atomically: true, encoding: .utf8)
-        let appEl = AXUIElementCreateApplication(pid)
-        var hitEl: AXUIElement?
-        if AXUIElementCopyElementAtPosition(appEl, Float(pt.x), Float(pt.y), &hitEl) == .success, let leaf = hitEl {
-            // Walk up at most 4 levels to find an explicit interactive control; NEVER fall back to AXWindow or AXWebArea!
-            var matchedControl: AXUIElement? = nil
-            var curr: AXUIElement = leaf
-            for _ in 0..<5 {
-                let r = getAttribute(curr, kAXRoleAttribute) as? String ?? ""
-                if containerStopRoles.contains(r) {
-                    break
+
+    withAutoPiP(windowID: windowID, appName: appName, pid: resolvedPID, point: pt) {
+        // Glide our virtual cursor smoothly to the target point so movement is clearly visible!
+        if let target = targetPoint {
+            VirtualCursorClient.move(to: target, speed: "normal")
+            usleep(400000)
+        }
+
+        let downType: CGEventType
+        let upType: CGEventType
+        switch button {
+        case .right:
+            downType = .rightMouseDown
+            upType = .rightMouseUp
+        case .center:
+            downType = .otherMouseDown
+            upType = .otherMouseUp
+        default:
+            downType = .leftMouseDown
+            upType = .leftMouseUp
+        }
+
+        let focusableRoles: Set<String> = ["AXTextField", "AXComboBox", "AXTextArea", "AXSearchField"]
+        let pressableRoles: Set<String> = ["AXButton", "AXLink", "AXCheckBox", "AXRadioButton", "AXMenuItem", "AXPopUpButton", "AXTextField", "AXComboBox", "AXTextArea", "AXSearchField", "AXTabButton"]
+        let containerStopRoles: Set<String> = ["AXWindow", "AXApplication", "AXWebArea", "AXScrollArea", "AXSplitGroup", "AXToolbar", "AXSheet"]
+
+        var handledViaAX = false
+        if let pid = resolvedPID, button == .left {
+            try? "\(pt.x),\(pt.y)".write(toFile: "/tmp/mcu_last_click_\(pid).txt", atomically: true, encoding: .utf8)
+            try? "\(pid)".write(toFile: "/tmp/mcu_last_target_pid.txt", atomically: true, encoding: .utf8)
+            let appEl = AXUIElementCreateApplication(pid)
+            var hitEl: AXUIElement?
+            if AXUIElementCopyElementAtPosition(appEl, Float(pt.x), Float(pt.y), &hitEl) == .success, let leaf = hitEl {
+                // Walk up at most 4 levels to find an explicit interactive control; NEVER fall back to AXWindow or AXWebArea!
+                var matchedControl: AXUIElement? = nil
+                var curr: AXUIElement = leaf
+                for _ in 0..<5 {
+                    let r = getAttribute(curr, kAXRoleAttribute) as? String ?? ""
+                    if containerStopRoles.contains(r) {
+                        break
+                    }
+                    if pressableRoles.contains(r) || focusableRoles.contains(r) {
+                        matchedControl = curr
+                        break
+                    }
+                    if let parent = getAttribute(curr, kAXParentAttribute) {
+                        curr = parent as! AXUIElement
+                    } else {
+                        break
+                    }
                 }
-                if pressableRoles.contains(r) || focusableRoles.contains(r) {
-                    matchedControl = curr
-                    break
-                }
-                if let parent = getAttribute(curr, kAXParentAttribute) {
-                    curr = parent as! AXUIElement
-                } else {
-                    break
-                }
-            }
-            
-            VirtualCursorClient.click(at: pt, button: "left")
-            if let ctrl = matchedControl {
-                // NEVER set kAXFocusedAttribute = true on WebKit/AppKit background elements as WebKit calls makeKeyAndOrderFront!
-                // Instead, perform kAXPressAction and track the clicked input coordinate for subsequent keyboard typing.
-                AXUIElementPerformAction(ctrl, kAXPressAction as CFString)
-                handledViaAX = true
-            } else {
-                let leafRole = getAttribute(leaf, kAXRoleAttribute) as? String ?? ""
-                if !containerStopRoles.contains(leafRole) {
-                    AXUIElementPerformAction(leaf, kAXPressAction as CFString)
+
+                VirtualCursorClient.click(at: pt, button: "left")
+                if let ctrl = matchedControl {
+                    // NEVER set kAXFocusedAttribute = true on WebKit/AppKit background elements as WebKit calls makeKeyAndOrderFront!
+                    // Instead, perform kAXPressAction and track the clicked input coordinate for subsequent keyboard typing.
+                    AXUIElementPerformAction(ctrl, kAXPressAction as CFString)
                     handledViaAX = true
+                } else {
+                    let leafRole = getAttribute(leaf, kAXRoleAttribute) as? String ?? ""
+                    if !containerStopRoles.contains(leafRole) {
+                        AXUIElementPerformAction(leaf, kAXPressAction as CFString)
+                        handledViaAX = true
+                    }
                 }
             }
         }
-    }
-    
-    // Only post raw CGEvent to PID if AX did not handle it (or for right/middle clicks)
-    if !handledViaAX {
-        for i in 1...clickCount {
-            VirtualCursorClient.click(at: pt, button: (button == .right ? "right" : "left"))
-            
-            let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: pt, mouseButton: button)
-            down?.setIntegerValueField(.mouseEventClickState, value: Int64(i))
-            if let pid = resolvedPID {
-                down?.postToPid(pid)
+
+        // Only post raw CGEvent to PID if AX did not handle it (or for right/middle clicks)
+        if !handledViaAX {
+            for i in 1...clickCount {
+                VirtualCursorClient.click(at: pt, button: (button == .right ? "right" : "left"))
+
+                let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: pt, mouseButton: button)
+                down?.setIntegerValueField(.mouseEventClickState, value: Int64(i))
+                if let pid = resolvedPID {
+                    down?.postToPid(pid)
+                }
+
+                usleep(15000)
+
+                let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: pt, mouseButton: button)
+                up?.setIntegerValueField(.mouseEventClickState, value: Int64(i))
+                if let pid = resolvedPID {
+                    up?.postToPid(pid)
+                }
+
+                if i < clickCount { usleep(120000) }
             }
-            
-            usleep(15000)
-            
-            let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: pt, mouseButton: button)
-            up?.setIntegerValueField(.mouseEventClickState, value: Int64(i))
-            if let pid = resolvedPID {
-                up?.postToPid(pid)
-            }
-            
-            if i < clickCount { usleep(120000) }
+        }
+
+        // For background overshadowed apps: perform native AX word selection if double-clicking text
+        if let pid = resolvedPID, clickCount >= 2 {
+            selectWordInBackground(pid: pid, at: pt)
         }
     }
-    
-    // For background overshadowed apps: perform native AX word selection if double-clicking text
-    if let pid = resolvedPID, clickCount >= 2 {
-        selectWordInBackground(pid: pid, at: pt)
-    }
-    
+
     AccessControlEngine.logAudit(action: "mouse_click", details: "Point (\(Int(pt.x)), \(Int(pt.y))), button=\(button == .left ? "left" : "right"), count=\(clickCount), targetPID=\(String(describing: resolvedPID))")
-    print("Clicked at (\(Int(pt.x)), \(Int(pt.y))) button=\(button == .left ? "left" : (button == .right ? "right" : "middle")) \(resolvedPID != nil ? "[Target PID: \(resolvedPID!)] (Zero-focus background delivery)" : "")")
+    let msg = "Clicked at (\(Int(pt.x)), \(Int(pt.y))) button=\(button == .left ? "left" : (button == .right ? "right" : "middle")) \(resolvedPID != nil ? "[Target PID: \(resolvedPID!)] (Zero-focus background delivery)" : "")"
+    emitOutput(msg)
+    return (true, msg)
 }
 
-func moveMouseVirtual(to target: CGPoint, speed: String? = nil, duration: Double? = nil) {
+@discardableResult
+func moveMouseVirtual(to target: CGPoint, speed: String? = nil, duration: Double? = nil, windowID: CGWindowID? = nil, appName: String? = nil, targetPID: pid_t? = nil) -> (success: Bool, message: String) {
     let validation = AccessControlEngine.validate(action: "cursor_move", point: target)
     if !validation.allowed {
         VirtualCursorClient.glow(color: "red")
         fputs("\(validation.reason)\n", stderr)
-        return
+        return (false, validation.reason)
     }
-    // Only moves the fancy overlay cursor - NEVER displaces the user's actual mouse!
-    VirtualCursorClient.move(to: target, speed: speed, duration: duration)
+    withAutoPiP(windowID: windowID, appName: appName, pid: targetPID, point: target) {
+        // Only moves the fancy overlay cursor - NEVER displaces the user's actual mouse!
+        VirtualCursorClient.move(to: target, speed: speed, duration: duration)
+        usleep(450000)
+    }
     AccessControlEngine.logAudit(action: "cursor_move", details: "Point (\(Int(target.x)), \(Int(target.y)))")
-    print("Fancy agent cursor moved to (\(Int(target.x)), \(Int(target.y))) [Zero user disruption]")
+    let msg = "Fancy agent cursor moved to (\(Int(target.x)), \(Int(target.y))) [Zero user disruption]"
+    emitOutput(msg)
+    return (true, msg)
 }
 
-func dragMouse(from start: CGPoint, to end: CGPoint, duration: Double = 0.4, restoreCursor: Bool = true) {
+@discardableResult
+func dragMouse(from start: CGPoint, to end: CGPoint, duration: Double = 0.4, restoreCursor: Bool = true, targetPID: pid_t? = nil, windowID: CGWindowID? = nil, appName: String? = nil) -> (success: Bool, message: String) {
     let validationStart = AccessControlEngine.validate(action: "mouse_drag", point: start)
     let validationEnd = AccessControlEngine.validate(action: "mouse_drag", point: end)
     if !validationStart.allowed || !validationEnd.allowed {
         let reason = !validationStart.allowed ? validationStart.reason : validationEnd.reason
         fputs("\(reason)\n", stderr)
         AccessControlEngine.logAudit(action: "mouse_drag", details: "From (\(Int(start.x)), \(Int(start.y))) to (\(Int(end.x)), \(Int(end.y)))", decision: "BLOCKED", reason: reason)
-        return
+        return (false, reason)
     }
-    
-    let originalUserPos = getMousePosition()
-    
-    VirtualCursorClient.move(to: start)
-    usleep(150000)
-    
-    let moveEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: start, mouseButton: .left)
-    moveEvent?.post(tap: .cghidEventTap)
-    usleep(25000)
-    
-    let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left)
-    down?.post(tap: .cghidEventTap)
-    usleep(20000)
-    
-    let steps = max(10, Int(duration * 40))
-    for i in 1...steps {
-        let t = Double(i) / Double(steps)
-        let ease = (1.0 - cos(t * .pi)) / 2.0
-        let currentX = start.x + (end.x - start.x) * ease
-        let currentY = start.y + (end.y - start.y) * ease
-        let pt = CGPoint(x: currentX, y: currentY)
-        
-        VirtualCursorClient.move(to: pt, speed: "instant")
-        let drag = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: pt, mouseButton: .left)
-        drag?.post(tap: .cghidEventTap)
-        usleep(useconds_t(duration / Double(steps) * 1_000_000))
+
+    let resolvedPID = resolveTargetPID(at: start, explicitPID: targetPID)
+
+    withAutoPiP(windowID: windowID, appName: appName, pid: resolvedPID, point: start) {
+        VirtualCursorClient.move(to: start)
+        usleep(180000)
+
+        if let pid = resolvedPID {
+            let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left)
+            down?.postToPid(pid)
+            usleep(20000)
+
+            let steps = max(10, Int(duration * 40))
+            for i in 1...steps {
+                let t = Double(i) / Double(steps)
+                let ease = (1.0 - cos(t * .pi)) / 2.0
+                let currentX = start.x + (end.x - start.x) * ease
+                let currentY = start.y + (end.y - start.y) * ease
+                let pt = CGPoint(x: currentX, y: currentY)
+
+                if i % 3 == 0 || i == steps {
+                    VirtualCursorClient.move(to: pt, speed: "instant")
+                }
+                let drag = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: pt, mouseButton: .left)
+                drag?.postToPid(pid)
+                usleep(useconds_t(duration / Double(steps) * 1_000_000))
+            }
+
+            let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left)
+            up?.postToPid(pid)
+        } else {
+            let originalUserPos = getMousePosition()
+
+            let moveEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: start, mouseButton: .left)
+            moveEvent?.post(tap: .cghidEventTap)
+            usleep(25000)
+
+            let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left)
+            down?.post(tap: .cghidEventTap)
+            usleep(20000)
+
+            let steps = max(10, Int(duration * 40))
+            for i in 1...steps {
+                let t = Double(i) / Double(steps)
+                let ease = (1.0 - cos(t * .pi)) / 2.0
+                let currentX = start.x + (end.x - start.x) * ease
+                let currentY = start.y + (end.y - start.y) * ease
+                let pt = CGPoint(x: currentX, y: currentY)
+
+                if i % 3 == 0 || i == steps {
+                    VirtualCursorClient.move(to: pt, speed: "instant")
+                }
+                let drag = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: pt, mouseButton: .left)
+                drag?.post(tap: .cghidEventTap)
+                usleep(useconds_t(duration / Double(steps) * 1_000_000))
+            }
+
+            let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left)
+            up?.post(tap: .cghidEventTap)
+
+            if restoreCursor {
+                usleep(10000)
+                CGWarpMouseCursorPosition(originalUserPos)
+                let restoreEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: originalUserPos, mouseButton: .left)
+                restoreEvent?.post(tap: .cghidEventTap)
+            }
+        }
     }
-    
-    let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left)
-    up?.post(tap: .cghidEventTap)
-    
-    if restoreCursor {
-        usleep(10000)
-        CGWarpMouseCursorPosition(originalUserPos)
-        let restoreEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: originalUserPos, mouseButton: .left)
-        restoreEvent?.post(tap: .cghidEventTap)
-    }
-    
+
     AccessControlEngine.logAudit(action: "mouse_drag", details: "From (\(Int(start.x)), \(Int(start.y))) to (\(Int(end.x)), \(Int(end.y))) (User cursor preserved: \(restoreCursor))")
-    print("Dragged from (\(Int(start.x)), \(Int(start.y))) to (\(Int(end.x)), \(Int(end.y))) [User cursor preserved]")
+    let msg = "Dragged from (\(Int(start.x)), \(Int(start.y))) to (\(Int(end.x)), \(Int(end.y))) \(resolvedPID != nil ? "[Target PID: \(resolvedPID!)]" : "[User cursor preserved]")"
+    emitOutput(msg)
+    return (true, msg)
 }
 
 func findScrollArea(pid: pid_t, at pt: CGPoint?) -> AXUIElement? {
@@ -3385,88 +3730,96 @@ func findScrollArea(pid: pid_t, at pt: CGPoint?) -> AXUIElement? {
     return results.first
 }
 
-func scrollWheel(dx: Int32, dy: Int32, at: CGPoint? = nil, targetPID: pid_t? = nil) {
+@discardableResult
+func scrollWheel(dx: Int32, dy: Int32, at: CGPoint? = nil, targetPID: pid_t? = nil, windowID: CGWindowID? = nil, appName: String? = nil) -> (success: Bool, message: String) {
     let validation = AccessControlEngine.validate(action: "mouse_scroll")
     if !validation.allowed {
         fputs("\(validation.reason)\n", stderr)
-        return
+        return (false, validation.reason)
     }
     let resolvedPID: pid_t?
     if let loc = at {
-        VirtualCursorClient.move(to: loc, speed: "fast")
-        usleep(40000)
         resolvedPID = resolveTargetPID(at: loc, explicitPID: targetPID)
     } else {
         resolvedPID = resolveLastTargetPID(explicitPID: targetPID)
     }
 
-    var vBar: AXUIElement? = nil
-    var hBar: AXUIElement? = nil
-    var beforeV: Double? = nil
-    var beforeH: Double? = nil
-    if let pid = resolvedPID, let scrollArea = findScrollArea(pid: pid, at: at) {
-        if let vb = getAttribute(scrollArea, kAXVerticalScrollBarAttribute) {
-            let el = vb as! AXUIElement
-            vBar = el
-            beforeV = (getAttribute(el, kAXValueAttribute) as? NSNumber)?.doubleValue
+    withAutoPiP(windowID: windowID, appName: appName, pid: resolvedPID, point: at) {
+        if let loc = at {
+            VirtualCursorClient.move(to: loc, speed: "fast")
+            usleep(60000)
         }
-        if let hb = getAttribute(scrollArea, kAXHorizontalScrollBarAttribute) {
-            let el = hb as! AXUIElement
-            hBar = el
-            beforeH = (getAttribute(el, kAXValueAttribute) as? NSNumber)?.doubleValue
-        }
-    }
 
-    let event = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0)
-    if let loc = at {
-        event?.location = loc
-    }
-    if let pid = resolvedPID {
-        event?.postToPid(pid)
-    } else {
-        event?.post(tap: .cghidEventTap)
-    }
-
-    // If background window (e.g. Safari/WebKit) ignores CGEvent.postToPid scroll events, apply smoothly via AXScrollBar
-    if let pid = resolvedPID {
-        usleep(20000)
-        if dy != 0, let vb = vBar, let initialV = beforeV {
-            let afterV = (getAttribute(vb, kAXValueAttribute) as? NSNumber)?.doubleValue ?? initialV
-            var settable: DarwinBoolean = false
-            AXUIElementIsAttributeSettable(vb, kAXValueAttribute as CFString, &settable)
-            if settable.boolValue && abs(afterV - initialV) < 0.0001 {
-                let delta = -Double(dy) * 0.012
-                let targetV = min(1.0, max(0.0, initialV + delta))
-                let steps = 5
-                for s in 1...steps {
-                    let frac = Double(s) / Double(steps)
-                    let stepVal = initialV + (targetV - initialV) * frac
-                    AXUIElementSetAttributeValue(vb, kAXValueAttribute as CFString, NSNumber(value: stepVal))
-                    usleep(12000)
-                }
+        var vBar: AXUIElement? = nil
+        var hBar: AXUIElement? = nil
+        var beforeV: Double? = nil
+        var beforeH: Double? = nil
+        if let pid = resolvedPID, let scrollArea = findScrollArea(pid: pid, at: at) {
+            if let vb = getAttribute(scrollArea, kAXVerticalScrollBarAttribute) {
+                let el = vb as! AXUIElement
+                vBar = el
+                beforeV = (getAttribute(el, kAXValueAttribute) as? NSNumber)?.doubleValue
+            }
+            if let hb = getAttribute(scrollArea, kAXHorizontalScrollBarAttribute) {
+                let el = hb as! AXUIElement
+                hBar = el
+                beforeH = (getAttribute(el, kAXValueAttribute) as? NSNumber)?.doubleValue
             }
         }
-        if dx != 0, let hb = hBar, let initialH = beforeH {
-            let afterH = (getAttribute(hb, kAXValueAttribute) as? NSNumber)?.doubleValue ?? initialH
-            var settable: DarwinBoolean = false
-            AXUIElementIsAttributeSettable(hb, kAXValueAttribute as CFString, &settable)
-            if settable.boolValue && abs(afterH - initialH) < 0.0001 {
-                let delta = -Double(dx) * 0.012
-                let targetH = min(1.0, max(0.0, initialH + delta))
-                let steps = 5
-                for s in 1...steps {
-                    let frac = Double(s) / Double(steps)
-                    let stepVal = initialH + (targetH - initialH) * frac
-                    AXUIElementSetAttributeValue(hb, kAXValueAttribute as CFString, NSNumber(value: stepVal))
-                    usleep(12000)
+
+        let event = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0)
+        if let loc = at {
+            event?.location = loc
+        }
+        if let pid = resolvedPID {
+            event?.postToPid(pid)
+        } else {
+            event?.post(tap: .cghidEventTap)
+        }
+
+        // If background window (e.g. Safari/WebKit) ignores CGEvent.postToPid scroll events, apply smoothly via AXScrollBar
+        if let pid = resolvedPID {
+            usleep(20000)
+            if dy != 0, let vb = vBar, let initialV = beforeV {
+                let afterV = (getAttribute(vb, kAXValueAttribute) as? NSNumber)?.doubleValue ?? initialV
+                var settable: DarwinBoolean = false
+                AXUIElementIsAttributeSettable(vb, kAXValueAttribute as CFString, &settable)
+                if settable.boolValue && abs(afterV - initialV) < 0.0001 {
+                    let delta = -Double(dy) * 0.012
+                    let targetV = min(1.0, max(0.0, initialV + delta))
+                    let steps = 5
+                    for s in 1...steps {
+                        let frac = Double(s) / Double(steps)
+                        let stepVal = initialV + (targetV - initialV) * frac
+                        AXUIElementSetAttributeValue(vb, kAXValueAttribute as CFString, NSNumber(value: stepVal))
+                        usleep(12000)
+                    }
                 }
             }
+            if dx != 0, let hb = hBar, let initialH = beforeH {
+                let afterH = (getAttribute(hb, kAXValueAttribute) as? NSNumber)?.doubleValue ?? initialH
+                var settable: DarwinBoolean = false
+                AXUIElementIsAttributeSettable(hb, kAXValueAttribute as CFString, &settable)
+                if settable.boolValue && abs(afterH - initialH) < 0.0001 {
+                    let delta = -Double(dx) * 0.012
+                    let targetH = min(1.0, max(0.0, initialH + delta))
+                    let steps = 5
+                    for s in 1...steps {
+                        let frac = Double(s) / Double(steps)
+                        let stepVal = initialH + (targetH - initialH) * frac
+                        AXUIElementSetAttributeValue(hb, kAXValueAttribute as CFString, NSNumber(value: stepVal))
+                        usleep(12000)
+                    }
+                }
+            }
+            try? "\(pid)".write(toFile: "/tmp/mcu_last_target_pid.txt", atomically: true, encoding: .utf8)
         }
-        try? "\(pid)".write(toFile: "/tmp/mcu_last_target_pid.txt", atomically: true, encoding: .utf8)
     }
 
     AccessControlEngine.logAudit(action: "mouse_scroll", details: "dx=\(dx), dy=\(dy), pid=\(resolvedPID?.description ?? "none")")
-    print("Scrolled deltaX=\(dx), deltaY=\(dy) \(resolvedPID != nil ? "[Target PID: \(resolvedPID!)] (Zero-focus background delivery)" : "")")
+    let msg = "Scrolled deltaX=\(dx), deltaY=\(dy) \(resolvedPID != nil ? "[Target PID: \(resolvedPID!)] (Zero-focus background delivery)" : "")"
+    emitOutput(msg)
+    return (true, msg)
 }
 
 func resolveLastTargetPID(explicitPID: pid_t?) -> pid_t? {
@@ -3566,7 +3919,7 @@ func typeString(_ text: String, targetPID: pid_t? = nil) {
     }
     
     AccessControlEngine.logAudit(action: "keyboard_type", details: "Typed \(text.count) characters \(resolvedPID != nil ? "to PID \(resolvedPID!)" : "")")
-    print("Typed: \"\(text)\" \(resolvedPID != nil ? "[Target PID: \(resolvedPID!)] (Zero-focus background delivery)" : "")")
+    emitOutput("Typed: \"\(text)\" \(resolvedPID != nil ? "[Target PID: \(resolvedPID!)] (Zero-focus background delivery)" : "")")
 }
 
 func pressKey(keyCode: CGKeyCode, flags: CGEventFlags = [], targetPID: pid_t? = nil) {
@@ -3605,7 +3958,7 @@ func triggerHotkeyCombo(_ combo: String, targetPID: pid_t? = nil) {
     }
     pressKey(keyCode: parsed.keyCode, flags: parsed.flags, targetPID: targetPID)
     AccessControlEngine.logAudit(action: "keyboard_hotkey", details: "\(combo) \(targetPID != nil ? "[PID: \(targetPID!)]" : "")")
-    print("Triggered hotkey combo '\(combo)' \(targetPID != nil ? "[Target PID: \(targetPID!)] (Overshadowed background delivery)" : "")")
+    emitOutput("Triggered hotkey combo '\(combo)' \(targetPID != nil ? "[Target PID: \(targetPID!)] (Overshadowed background delivery)" : "")")
 }
 
 // MARK: - Clipboard Management
@@ -3693,27 +4046,29 @@ func printUsage() {
     print(usage)
 }
 
-func resizeWindowWithVirtualCursor(windowID wid: Int, targetWidth: Double, targetHeight: Double, duration: Double = 0.6) {
+@discardableResult
+func resizeWindowWithVirtualCursor(windowID wid: Int, targetWidth: Double, targetHeight: Double, duration: Double = 0.6) -> (success: Bool, message: String) {
     let windows = getWindowsList(allLayers: true)
     guard let targetWin = windows.first(where: { ($0["id"] as? Int) == wid }),
           let pidInt = (targetWin["pid"] as? Int) ?? (targetWin["pid"] as? Int32).map(Int.init),
           let b = targetWin["bounds"] as? [String: Any] else {
-        fputs("Error: Could not locate window \(wid)\n", stderr)
-        exit(1)
+        let msg = "Error: Could not locate window \(wid)"
+        fputs(msg + "\n", stderr)
+        return (false, msg)
     }
-    
+
     func parseCoord(_ val: Any?) -> Double {
         if let d = val as? Double { return d }
         if let f = val as? CGFloat { return Double(f) }
         if let i = val as? Int { return Double(i) }
         return 0.0
     }
-    
+
     let curX = parseCoord(b["x"])
     let curY = parseCoord(b["y"])
     let curW = parseCoord(b["width"])
     let curH = parseCoord(b["height"])
-    
+
     let pid = pid_t(pidInt)
     let appEl = AXUIElementCreateApplication(pid)
     guard let winElements = getAttribute(appEl, kAXWindowsAttribute) as? [AXUIElement],
@@ -3721,50 +4076,55 @@ func resizeWindowWithVirtualCursor(windowID wid: Int, targetWidth: Double, targe
               var id: CGWindowID = 0
               return _AXUIElementGetWindow(el, &id) == .success && Int(id) == wid
           }) ?? winElements.first else {
-        fputs("Error: Could not obtain AXUIElement for window \(wid)\n", stderr)
-        exit(1)
+        let msg = "Error: Could not obtain AXUIElement for window \(wid)"
+        fputs(msg + "\n", stderr)
+        return (false, msg)
     }
-    
+
     let startCorner = CGPoint(x: curX + curW, y: curY + curH)
     let endCorner = CGPoint(x: curX + targetWidth, y: curY + targetHeight)
-    
-    // 1. Smoothly glide virtual cursor to bottom-right corner of target window
-    VirtualCursorClient.move(to: startCorner, speed: "normal")
-    usleep(450000)
-    
-    // 2. Visual grab/press ripple at the resize corner
-    VirtualCursorClient.click(at: startCorner)
-    usleep(80000)
-    
-    // 3. Smooth animated resizing along sinusoidal ease curve in 25-35 steps
-    let steps = max(15, Int(duration * 40))
-    for step in 1...steps {
-        let t = Double(step) / Double(steps)
-        let ease = (1.0 - cos(t * .pi)) / 2.0
-        let w = curW + (targetWidth - curW) * ease
-        let h = curH + (targetHeight - curH) * ease
-        let corner = CGPoint(x: curX + w, y: curY + h)
-        
-        var size = CGSize(width: w, height: h)
-        if let sizeVal = AXValueCreate(.cgSize, &size) {
-            AXUIElementSetAttributeValue(winEl, kAXSizeAttribute as CFString, sizeVal)
+
+    withAutoPiP(windowID: CGWindowID(wid), pid: pid) {
+        // 1. Smoothly glide virtual cursor to bottom-right corner of target window
+        VirtualCursorClient.move(to: startCorner, speed: "normal")
+        usleep(450000)
+
+        // 2. Visual grab/press ripple at the resize corner
+        VirtualCursorClient.click(at: startCorner)
+        usleep(80000)
+
+        // 3. Smooth animated resizing along sinusoidal ease curve in 25-35 steps
+        let steps = max(15, Int(duration * 40))
+        for step in 1...steps {
+            let t = Double(step) / Double(steps)
+            let ease = (1.0 - cos(t * .pi)) / 2.0
+            let w = curW + (targetWidth - curW) * ease
+            let h = curH + (targetHeight - curH) * ease
+            let corner = CGPoint(x: curX + w, y: curY + h)
+
+            var size = CGSize(width: w, height: h)
+            if let sizeVal = AXValueCreate(.cgSize, &size) {
+                AXUIElementSetAttributeValue(winEl, kAXSizeAttribute as CFString, sizeVal)
+            }
+            VirtualCursorClient.move(to: corner, speed: "instant")
+            usleep(useconds_t(duration / Double(steps) * 1_000_000))
         }
-        VirtualCursorClient.move(to: corner, speed: "instant")
-        usleep(useconds_t(duration / Double(steps) * 1_000_000))
+
+        // Final exact size
+        var finalSize = CGSize(width: targetWidth, height: targetHeight)
+        if let finalVal = AXValueCreate(.cgSize, &finalSize) {
+            AXUIElementSetAttributeValue(winEl, kAXSizeAttribute as CFString, finalVal)
+        }
+        VirtualCursorClient.move(to: endCorner, speed: "instant")
+        usleep(40000)
+
+        // 4. Release ripple at final position
+        VirtualCursorClient.click(at: endCorner)
     }
-    
-    // Final exact size
-    var finalSize = CGSize(width: targetWidth, height: targetHeight)
-    if let finalVal = AXValueCreate(.cgSize, &finalSize) {
-        AXUIElementSetAttributeValue(winEl, kAXSizeAttribute as CFString, finalVal)
-    }
-    VirtualCursorClient.move(to: endCorner, speed: "instant")
-    usleep(40000)
-    
-    // 4. Release ripple at final position
-    VirtualCursorClient.click(at: endCorner)
-    
-    print("Window \(wid) resized with virtual cursor from (\(Int(curW)), \(Int(curH))) to (\(Int(targetWidth)), \(Int(targetHeight))) [Zero user disruption]")
+
+    let msg = "Window \(wid) resized with virtual cursor from (\(Int(curW)), \(Int(curH))) to (\(Int(targetWidth)), \(Int(targetHeight))) [Zero user disruption]"
+    emitOutput(msg)
+    return (true, msg)
 }
 
 // MARK: - Apple Vision OCR & Semantic Interaction
@@ -3792,35 +4152,36 @@ class VisionOCREngine {
             return nil
         }
         let bounds = CGRect(x: bx, y: by, width: bw, height: bh)
-        
-        let tmpFile = "/tmp/mcu_ocr_debug_last.png"
+
+        let tmpFile = "/tmp/mcu_ocr_window_\(ProcessInfo.processInfo.processIdentifier)_\(windowID).png"
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
         task.arguments = ["-x", "-o", "-l\(windowID)", tmpFile]
-        try? task.run()
+        guard (try? task.run()) != nil else { return nil }
         task.waitUntilExit()
-        
-        guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: tmpFile) as CFURL, nil),
-              let cgImg = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+
+        defer { try? FileManager.default.removeItem(atPath: tmpFile) }
+        guard task.terminationStatus == 0,
+              let cgImg = loadMaterializedCGImage(fromFile: tmpFile) else {
             fputs("Error: Could not load captured window image from \(tmpFile)\n", stderr)
             return nil
         }
         return (cgImg, bounds)
     }
-    
+
     static func captureScreenImage() -> (image: CGImage, bounds: CGRect)? {
         let screenRect = NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: 1920, height: 1080)
         let tmpFile = "/tmp/mcu_ocr_screen_\(ProcessInfo.processInfo.processIdentifier).png"
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
         task.arguments = ["-x", "-m", tmpFile]
-        try? task.run()
+        guard (try? task.run()) != nil else { return nil }
         task.waitUntilExit()
-        
+
         defer { try? FileManager.default.removeItem(atPath: tmpFile) }
-        guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: tmpFile) as CFURL, nil),
-              let cgImg = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-            fputs("Error: Could not load captured window image from \(tmpFile)\n", stderr)
+        guard task.terminationStatus == 0,
+              let cgImg = loadMaterializedCGImage(fromFile: tmpFile) else {
+            fputs("Error: Could not load captured screen image from \(tmpFile)\n", stderr)
             return nil
         }
         return (cgImg, screenRect)
@@ -3902,60 +4263,44 @@ func clickText(
     clickCount: Int = 1,
     autoClean: Bool = false
 ) -> (success: Bool, message: String) {
-    var targetWID = windowID
-    if targetWID == nil, let app = appName {
-        targetWID = PiPWindowController.firstWindowID(matchingApp: app)
+    let resolved = resolveExplicitTarget(appName: appName, windowID: windowID, requireWindow: (appName != nil || windowID != nil))
+    if let err = resolved.error {
+        return (false, err)
     }
-    
-    var targetPID: pid_t? = nil
-    if let app = appName {
-        let apps = NSWorkspace.shared.runningApplications
-        if let match = apps.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(app) == true }) {
-            targetPID = match.processIdentifier
+    let targetWID = resolved.windowID
+    let targetPID = resolved.pid
+
+    // Capture target cleanly before or inside PiP oversight
+    return withAutoPiP(windowID: targetWID, appName: appName, pid: targetPID) {
+        guard let capture = (targetWID != nil ? VisionOCREngine.captureWindowImage(windowID: targetWID!) : VisionOCREngine.captureScreenImage()) else {
+            return (false, "Error: Failed to capture target image for OCR")
         }
-    } else if let wid = targetWID {
-        let wins = getWindowsList(allLayers: true)
-        if let win = wins.first(where: { ($0["id"] as? Int) == Int(wid) }),
-           let p = (win["pid"] as? Int) ?? (win["pid"] as? Int32).map(Int.init) {
-            targetPID = pid_t(p)
+
+        let (items, rawObs) = VisionOCREngine.recognize(cgImage: capture.image, bounds: capture.bounds, fast: true)
+        guard let match = VisionOCREngine.findText(query: query, in: items, observations: rawObs, bounds: capture.bounds) else {
+            return (false, "Error: Text '\(query)' not found in target")
         }
+
+        let clickPoint = match.targetPoint
+        let clickRes = clickMouseNonDisruptive(
+            at: clickPoint,
+            button: button,
+            clickCount: clickCount,
+            restoreCursor: true,
+            targetPID: targetPID,
+            windowID: targetWID,
+            appName: appName
+        )
+        if !clickRes.success {
+            return clickRes
+        }
+
+        if autoClean {
+            VirtualCursorClient.done()
+        }
+
+        return (true, "Clicked text '\(match.matchedText)' at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) \(targetPID != nil ? "[Target PID: \(targetPID!)] (Overshadowed background delivery)" : "")")
     }
-    
-    // 1. Activate PiP preview if window/app specified
-    if targetWID != nil || appName != nil {
-        VirtualCursorClient.pipShow(appName: appName, windowID: targetWID.map(Int.init))
-    }
-    
-    // 2. Capture target
-    guard let capture = (targetWID != nil ? VisionOCREngine.captureWindowImage(windowID: targetWID!) : VisionOCREngine.captureScreenImage()) else {
-        return (false, "Error: Failed to capture target image for OCR")
-    }
-    
-    // 3. Run OCR
-    let (items, rawObs) = VisionOCREngine.recognize(cgImage: capture.image, bounds: capture.bounds, fast: true)
-    guard let match = VisionOCREngine.findText(query: query, in: items, observations: rawObs, bounds: capture.bounds) else {
-        return (false, "Error: Text '\(query)' not found in target")
-    }
-    
-    let clickPoint = match.targetPoint
-    
-    // 4. Glide virtual cursor smoothly to point
-    VirtualCursorClient.move(to: clickPoint, speed: "normal")
-    usleep(250000)
-    
-    // 5. Tactile press & ripple animation
-    VirtualCursorClient.click(at: clickPoint)
-    
-    // 6. Non-disruptive background delivery to target PID
-    clickMouseNonDisruptive(at: clickPoint, button: button, clickCount: clickCount, restoreCursor: true, targetPID: targetPID)
-    
-    // 7. Auto clean if requested
-    if autoClean {
-        usleep(300000)
-        VirtualCursorClient.done()
-    }
-    
-    return (true, "Clicked text '\(match.matchedText)' at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) \(targetPID != nil ? "[Target PID: \(targetPID!)] (Overshadowed background delivery)" : "")")
 }
 
 // MARK: - Native MCP Server (stdio JSON-RPC 2.0)
@@ -3967,95 +4312,96 @@ func sendMCPResponse(_ dict: [String: Any]) {
     }
 }
 
-func handleMCPToolCall(name: String, args: [String: Any]) -> String {
+func handleMCPToolCall(name: String, args: [String: Any]) -> (text: String, isError: Bool) {
     switch name {
     case "click", "mouse_click":
         guard let x = (args["x"] as? NSNumber)?.doubleValue,
               let y = (args["y"] as? NSNumber)?.doubleValue else {
-            return "Error: missing required x, y coordinates"
+            return ("Error: missing required x, y coordinates", true)
         }
         let btnStr = (args["button"] as? String)?.lowercased() ?? "left"
         let btn: CGMouseButton = (btnStr == "right") ? .right : ((btnStr == "middle" || btnStr == "center") ? .center : .left)
         let count = (args["count"] as? NSNumber)?.intValue ?? 1
-        var targetPID: pid_t? = nil
-        if let app = args["app"] as? String {
-            let apps = NSWorkspace.shared.runningApplications
-            if let match = apps.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(app) == true }) {
-                targetPID = match.processIdentifier
-            }
+        let app = args["app"] as? String
+        let wid = (args["window"] as? NSNumber).map { CGWindowID($0.intValue) }
+        let resolved = resolveExplicitTarget(appName: app, windowID: wid)
+        if let err = resolved.error {
+            return (err, true)
         }
-        clickMouseNonDisruptive(at: CGPoint(x: x, y: y), button: btn, clickCount: count, restoreCursor: true, targetPID: targetPID)
+        let clickRes = clickMouseNonDisruptive(
+            at: CGPoint(x: x, y: y),
+            button: btn,
+            clickCount: count,
+            restoreCursor: true,
+            targetPID: resolved.pid,
+            windowID: resolved.windowID,
+            appName: app
+        )
         if let autoClean = args["done"] as? Bool, autoClean {
-            usleep(300000)
             VirtualCursorClient.done()
         }
-        return "Clicked at (\(Int(x)), \(Int(y))) count=\(count) button=\(btnStr)"
+        return (clickRes.message, !clickRes.success)
 
     case "move", "mouse_move":
         guard let x = (args["x"] as? NSNumber)?.doubleValue,
               let y = (args["y"] as? NSNumber)?.doubleValue else {
-            return "Error: missing x, y coordinates"
+            return ("Error: missing x, y coordinates", true)
         }
-        moveMouseVirtual(to: CGPoint(x: x, y: y), speed: "normal")
-        return "Moved virtual cursor to (\(Int(x)), \(Int(y)))"
+        let app = args["app"] as? String
+        let wid = (args["window"] as? NSNumber).map { CGWindowID($0.intValue) }
+        let resolved = resolveExplicitTarget(appName: app, windowID: wid)
+        if let err = resolved.error {
+            return (err, true)
+        }
+        let res = moveMouseVirtual(to: CGPoint(x: x, y: y), speed: "normal", windowID: resolved.windowID, appName: app, targetPID: resolved.pid)
+        return (res.message, !res.success)
 
     case "type", "keyboard_type":
-        guard let text = args["text"] as? String else { return "Error: missing text" }
-        var targetPID: pid_t? = nil
-        if let app = args["app"] as? String {
-            let apps = NSWorkspace.shared.runningApplications
-            if let match = apps.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(app) == true }) {
-                targetPID = match.processIdentifier
-            }
+        guard let text = args["text"] as? String else { return ("Error: missing text", true) }
+        let app = args["app"] as? String
+        let wid = (args["window"] as? NSNumber).map { CGWindowID($0.intValue) }
+        let resolved = resolveExplicitTarget(appName: app, windowID: wid)
+        if let err = resolved.error {
+            return (err, true)
         }
-        typeString(text, targetPID: targetPID)
-        return "Typed: \"\(text)\""
+        typeString(text, targetPID: resolved.pid)
+        return ("Typed: \"\(text)\"", false)
 
     case "key", "keyboard_key":
         guard let keyName = (args["name"] as? String ?? args["key"] as? String)?.lowercased() else {
-            return "Error: missing key name"
+            return ("Error: missing key name", true)
         }
         guard let code = keyNameToKeyCode[keyName] else {
-            return "Error: unknown key '\(keyName)'"
+            return ("Error: unknown key '\(keyName)'", true)
         }
-        var targetPID: pid_t? = nil
-        if let app = args["app"] as? String {
-            let apps = NSWorkspace.shared.runningApplications
-            if let match = apps.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(app) == true }) {
-                targetPID = match.processIdentifier
-            }
+        let app = args["app"] as? String
+        let wid = (args["window"] as? NSNumber).map { CGWindowID($0.intValue) }
+        let resolved = resolveExplicitTarget(appName: app, windowID: wid)
+        if let err = resolved.error {
+            return (err, true)
         }
-        pressKey(keyCode: code, targetPID: targetPID)
-        return "Pressed key '\(keyName)'"
+        pressKey(keyCode: code, targetPID: resolved.pid)
+        return ("Pressed key '\(keyName)'", false)
 
     case "hotkey", "keyboard_hotkey":
         guard let combo = args["combo"] as? String else {
-            return "Error: missing 'combo' argument (e.g. 'cmd+shift+n')"
+            return ("Error: missing 'combo' argument (e.g. 'cmd+shift+n')", true)
         }
-        var targetPID: pid_t? = nil
-        if let app = args["app"] as? String {
-            let apps = NSWorkspace.shared.runningApplications
-            if let match = apps.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(app) == true }) {
-                targetPID = match.processIdentifier
-            }
-        } else if let wid = (args["window"] as? NSNumber)?.intValue {
-            let wins = getWindowsList(allLayers: true)
-            if let win = wins.first(where: { ($0["id"] as? Int) == wid }),
-               let p = (win["pid"] as? Int) ?? (win["pid"] as? Int32).map(Int.init) {
-                targetPID = pid_t(p)
-            }
+        let app = args["app"] as? String
+        let wid = (args["window"] as? NSNumber).map { CGWindowID($0.intValue) }
+        let resolved = resolveExplicitTarget(appName: app, windowID: wid)
+        if let err = resolved.error {
+            return (err, true)
         }
-        triggerHotkeyCombo(combo, targetPID: targetPID)
-        return "Triggered hotkey combo '\(combo)' \(targetPID != nil ? "[Target PID: \(targetPID!)]" : "")"
+        triggerHotkeyCombo(combo, targetPID: resolved.pid)
+        return ("Triggered hotkey combo '\(combo)' \(resolved.pid != nil ? "[Target PID: \(resolved.pid!)]" : "")", false)
 
     case "browser_open":
-        guard let url = args["url"] as? String else { return "Error: missing 'url'" }
+        guard let url = args["url"] as? String else { return ("Error: missing 'url'", true) }
         let appName = args["app"] as? String ?? "Safari"
         let isPrivate = (args["private"] as? Bool) ?? (args["incognito"] as? Bool) ?? false
-        
-        let apps = NSWorkspace.shared.runningApplications
-        let isRunning = apps.contains(where: { $0.localizedName?.localizedCaseInsensitiveContains(appName) == true })
-        if !isRunning {
+
+        if findRunningApplication(matching: appName) == nil {
             let config = NSWorkspace.OpenConfiguration()
             config.activates = false
             if let bundleID = appName.localizedCaseInsensitiveContains("Safari") ? "com.apple.Safari" : nil,
@@ -4064,12 +4410,12 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> String {
                 sleep(2)
             }
         }
-        
-        if isPrivate, let match = NSWorkspace.shared.runningApplications.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(appName) == true }) {
+
+        if isPrivate, let match = findRunningApplication(matching: appName) {
             triggerHotkeyCombo("cmd+shift+n", targetPID: match.processIdentifier)
             usleep(600000)
         }
-        
+
         if appName.localizedCaseInsensitiveContains("Safari") {
             let script = "tell application \"Safari\" to set URL of current tab of front window to \"\(url)\""
             var error: NSDictionary?
@@ -4077,12 +4423,23 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> String {
                 appleScript.executeAndReturnError(&error)
             }
         }
-        VirtualCursorClient.pipShow(appName: appName, windowID: nil)
-        return "Opened \(url) in \(appName) \(isPrivate ? "(Private Browsing) " : "")[Zero focus stolen, PiP oversight active]"
+        let wid = PiPWindowController.firstWindowID(matchingApp: appName)
+        VirtualCursorClient.pipShow(appName: appName, windowID: wid.map(Int.init))
+        return ("Opened \(url) in \(appName) \(isPrivate ? "(Private Browsing) " : "")[Zero focus stolen, PiP oversight active]", false)
 
     case "screen_capture":
         let output = args["output"] as? String ?? "/tmp/mcu_screen.png"
-        let wid = (args["window"] as? NSNumber).map { CGWindowID($0.intValue) }
+        let widNum = (args["window"] as? NSNumber) ?? (args["wid"] as? NSNumber)
+        let app = args["app"] as? String
+        let explicitWID = widNum.map { CGWindowID($0.intValue) }
+        var resolvedWID = explicitWID
+        if explicitWID != nil || app != nil {
+            let resolved = resolveExplicitTarget(appName: app, windowID: explicitWID, requireWindow: true)
+            if let err = resolved.error {
+                return (err, true)
+            }
+            resolvedWID = resolved.windowID
+        }
         var rect: CGRect? = nil
         if let rectStr = args["rect"] as? String {
             let parts = rectStr.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
@@ -4090,57 +4447,72 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> String {
                 rect = CGRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3])
             }
         }
-        captureScreen(output: output, scale1x: true, withGrid: false, windowID: wid, rect: rect, includeCursor: false)
-        return "Screen captured to \(output)"
+        let res = captureScreen(output: output, scale1x: true, withGrid: false, windowID: resolvedWID, rect: rect, includeCursor: false)
+        return res.success ? ("Screen captured to \(output)", false) : (res.message, true)
 
     case "window_capture":
-        var targetWID: CGWindowID? = nil
-        if let wid = (args["window"] as? NSNumber)?.intValue ?? (args["wid"] as? NSNumber)?.intValue {
-            targetWID = CGWindowID(wid)
-        } else if let app = args["app"] as? String {
-            targetWID = PiPWindowController.firstWindowID(matchingApp: app)
+        let widArg = (args["window"] as? NSNumber).map { CGWindowID($0.intValue) } ?? (args["wid"] as? NSNumber).map { CGWindowID($0.intValue) }
+        let appArg = args["app"] as? String
+        guard widArg != nil || appArg != nil else {
+            return ("Error: Window not found. Please provide a valid 'app' name or 'window' ID.", true)
         }
-        guard let wid = targetWID else {
-            return "Error: Window not found. Please provide a valid 'app' name or 'window' ID."
+        let resolved = resolveExplicitTarget(appName: appArg, windowID: widArg, requireWindow: true)
+        if let err = resolved.error {
+            return (err, true)
+        }
+        guard let wid = resolved.windowID else {
+            return ("Error: Window not found. Please provide a valid 'app' name or 'window' ID.", true)
         }
         let output = args["output"] as? String ?? "/tmp/mcu_window_\(wid).png"
         let scale1x = (args["scale_1x"] as? Bool) ?? true
-        captureScreen(output: output, scale1x: scale1x, withGrid: false, windowID: wid, rect: nil, includeCursor: false)
-        return "Background window \(wid) captured to \(output) [Overshadowed background isolated]"
+        let res = captureScreen(output: output, scale1x: scale1x, withGrid: false, windowID: wid, rect: nil, includeCursor: false)
+        return res.success ? ("Background window \(wid) captured to \(output) [Overshadowed background isolated]", false) : (res.message, true)
 
     case "pip_show":
         let app = args["app"] as? String
-        let wid = (args["window"] as? NSNumber)?.intValue
-        VirtualCursorClient.pipShow(appName: app, windowID: wid)
-        return "PiP live preview activated for '\(app ?? (wid != nil ? "Window \(wid!)" : "Active Window"))'"
+        let wid = (args["window"] as? NSNumber).map { CGWindowID($0.intValue) }
+        var resolvedWID = wid
+        if app != nil || wid != nil {
+            let resolved = resolveExplicitTarget(appName: app, windowID: wid, requireWindow: true)
+            if let err = resolved.error {
+                return (err, true)
+            }
+            resolvedWID = resolved.windowID
+        }
+        VirtualCursorClient.pipShow(appName: app, windowID: resolvedWID.map(Int.init))
+        return ("PiP live preview activated for '\(app ?? (resolvedWID != nil ? "Window \(resolvedWID!)" : "Active Window"))'", false)
 
     case "pip_hide":
         VirtualCursorClient.pipHide()
-        return "All PiP live previews closed"
+        return ("All PiP live previews closed", false)
 
     case "window_list":
         let windows = getWindowsList(allLayers: false)
         if let data = try? JSONSerialization.data(withJSONObject: windows, options: .prettyPrinted),
            let str = String(data: data, encoding: .utf8) {
-            return str
+            return (str, false)
         }
-        return "[]"
+        return ("[]", false)
 
     case "done", "cleanup":
         VirtualCursorClient.done()
-        return "All PiP previews and virtual cursor dismissed"
+        return ("All PiP previews and virtual cursor dismissed", false)
 
     case "ocr":
-        var targetWID: CGWindowID? = nil
-        if let wid = (args["window"] as? NSNumber)?.intValue ?? (args["wid"] as? NSNumber)?.intValue {
-            targetWID = CGWindowID(wid)
-        } else if let app = args["app"] as? String {
-            targetWID = PiPWindowController.firstWindowID(matchingApp: app)
+        let widArg = (args["window"] as? NSNumber).map { CGWindowID($0.intValue) } ?? (args["wid"] as? NSNumber).map { CGWindowID($0.intValue) }
+        let appArg = args["app"] as? String
+        var targetWID = widArg
+        if widArg != nil || appArg != nil {
+            let resolved = resolveExplicitTarget(appName: appArg, windowID: widArg, requireWindow: true)
+            if let err = resolved.error {
+                return (err, true)
+            }
+            targetWID = resolved.windowID
         }
         let fast = (args["fast"] as? Bool) ?? true
-        
+
         guard let capture = (targetWID != nil ? VisionOCREngine.captureWindowImage(windowID: targetWID!) : VisionOCREngine.captureScreenImage()) else {
-            return "Error: Failed to capture target image for OCR"
+            return ("Error: Failed to capture target image for OCR", true)
         }
         let (items, _) = VisionOCREngine.recognize(cgImage: capture.image, bounds: capture.bounds, fast: fast)
         if let data = try? JSONSerialization.data(withJSONObject: items.map { [
@@ -4154,13 +4526,13 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> String {
             "center_y": $0.centerY
         ] }, options: .prettyPrinted),
            let str = String(data: data, encoding: .utf8) {
-            return str
+            return (str, false)
         }
-        return "[]"
+        return ("[]", false)
 
     case "click_text":
         guard let query = args["query"] as? String else {
-            return "Error: missing required 'query' parameter"
+            return ("Error: missing required 'query' parameter", true)
         }
         let app = args["app"] as? String
         let wid = (args["window"] as? NSNumber).map { CGWindowID($0.intValue) }
@@ -4168,13 +4540,13 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> String {
         let btn: CGMouseButton = (btnStr == "right") ? .right : ((btnStr == "middle" || btnStr == "center") ? .center : .left)
         let count = (args["count"] as? NSNumber)?.intValue ?? 1
         let done = (args["done"] as? Bool) ?? false
-        
+
         let result = clickText(query: query, appName: app, windowID: wid, button: btn, clickCount: count, autoClean: done)
-        return result.message
+        return (result.message, !result.success)
 
     case "scroll", "mouse_scroll":
         guard let dy = (args["dy"] as? NSNumber)?.int32Value else {
-            return "Error: missing required 'dy' parameter"
+            return ("Error: missing required 'dy' parameter", true)
         }
         let dx = (args["dx"] as? NSNumber)?.int32Value ?? 0
         var pt: CGPoint? = nil
@@ -4182,68 +4554,53 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> String {
            let y = (args["y"] as? NSNumber)?.doubleValue {
             pt = CGPoint(x: x, y: y)
         }
-        var targetPID: pid_t? = nil
-        if let app = args["app"] as? String {
-            let apps = NSWorkspace.shared.runningApplications
-            if let match = apps.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(app) == true }) {
-                targetPID = match.processIdentifier
-            }
-        } else if let wid = (args["window"] as? NSNumber)?.intValue {
-            let wins = getWindowsList(allLayers: true)
-            if let win = wins.first(where: { ($0["id"] as? Int) == wid }),
-               let p = (win["pid"] as? Int) ?? (win["pid"] as? Int32).map(Int.init) {
-                targetPID = pid_t(p)
-            }
+        let app = args["app"] as? String
+        let wid = (args["window"] as? NSNumber).map { CGWindowID($0.intValue) }
+        let resolved = resolveExplicitTarget(appName: app, windowID: wid)
+        if let err = resolved.error {
+            return (err, true)
         }
-        scrollWheel(dx: dx, dy: dy, at: pt, targetPID: targetPID)
+        let scrollRes = scrollWheel(dx: dx, dy: dy, at: pt, targetPID: resolved.pid, windowID: resolved.windowID, appName: app)
         if (args["done"] as? Bool) == true {
-            usleep(200000)
             VirtualCursorClient.done()
         }
-        return "Scrolled deltaX=\(dx), deltaY=\(dy) \(targetPID != nil ? "[Target PID: \(targetPID!)]" : "")"
+        return (scrollRes.message, !scrollRes.success)
 
     case "select_range":
         guard let x1 = (args["from_x"] as? NSNumber)?.doubleValue,
               let y1 = (args["from_y"] as? NSNumber)?.doubleValue,
               let x2 = (args["to_x"] as? NSNumber)?.doubleValue,
               let y2 = (args["to_y"] as? NSNumber)?.doubleValue else {
-            return "Error: missing from_x, from_y, to_x, to_y"
+            return ("Error: missing from_x, from_y, to_x, to_y", true)
         }
         let from = CGPoint(x: x1, y: y1)
         let to = CGPoint(x: x2, y: y2)
-        var targetPID: pid_t? = nil
         let app = args["app"] as? String
-        if let app = app {
-            let apps = NSWorkspace.shared.runningApplications
-            if let match = apps.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(app) == true }) {
-                targetPID = match.processIdentifier
-            }
-        } else if let wid = (args["window"] as? NSNumber)?.intValue {
-            let wins = getWindowsList(allLayers: true)
-            if let win = wins.first(where: { ($0["id"] as? Int) == wid }),
-               let p = (win["pid"] as? Int) ?? (win["pid"] as? Int32).map(Int.init) {
-                targetPID = pid_t(p)
-            }
+        let wid = (args["window"] as? NSNumber).map { CGWindowID($0.intValue) }
+        let resolved = resolveExplicitTarget(appName: app, windowID: wid)
+        if let err = resolved.error {
+            return (err, true)
         }
         let done = (args["done"] as? Bool) ?? false
-        selectRangeAction(from: from, to: to, targetPID: targetPID, appName: app, autoClean: done)
-        return "Selected range from (\(Int(x1)), \(Int(y1))) to (\(Int(x2)), \(Int(y2)))"
+        let msg = selectRangeAction(from: from, to: to, targetPID: resolved.pid, windowID: resolved.windowID, appName: app, autoClean: done)
+        return (msg, false)
 
     default:
-        return "Unknown tool: \(name)"
+        return ("Unknown tool: \(name)", true)
     }
 }
 
 func runMCPServer() {
+    isMCPServerMode = true
     FileHandle.standardError.write("Starting native mcu MCP server (stdio JSON-RPC 2.0)...\n".data(using: .utf8)!)
     while let line = readLine() {
         guard !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
         guard let data = line.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let method = json["method"] as? String else { continue }
-        
+
         let id = json["id"]
-        
+
         switch method {
         case "initialize":
             let resp: [String: Any] = [
@@ -4261,23 +4618,25 @@ func runMCPServer() {
                 ]
             ]
             sendMCPResponse(resp)
-            
+
         case "notifications/initialized":
             break
-            
+
         case "ping":
-            let resp: [String: Any] = [
-                "jsonrpc": "2.0",
-                "id": id ?? 1,
-                "result": [:]
-            ]
-            sendMCPResponse(resp)
-            
+            if let reqID = id {
+                let resp: [String: Any] = [
+                    "jsonrpc": "2.0",
+                    "id": reqID,
+                    "result": [:]
+                ]
+                sendMCPResponse(resp)
+            }
+
         case "tools/list":
             let tools: [[String: Any]] = [
                 [
                     "name": "click",
-                    "description": "Click or double-click at coordinates using virtual cursor with zero hardware mouse disruption and zero focus stealing.",
+                    "description": "Click or double-click at coordinates using virtual cursor with automatic PiP oversight, zero hardware mouse disruption, and zero focus stealing.",
                     "inputSchema": [
                         "type": "object",
                         "properties": [
@@ -4286,19 +4645,22 @@ func runMCPServer() {
                             "button": ["type": "string", "enum": ["left", "right", "middle"], "default": "left"],
                             "count": ["type": "integer", "default": 1],
                             "app": ["type": "string", "description": "Target application name if background"],
-                            "done": ["type": "boolean", "description": "Automatically clean up after click", "default": false]
+                            "window": ["type": "integer", "description": "Target window ID"],
+                            "done": ["type": "boolean", "description": "Also dismiss virtual cursor overlay after automatic PiP exit", "default": false]
                         ],
                         "required": ["x", "y"]
                     ]
                 ],
                 [
                     "name": "move",
-                    "description": "Smoothly glide the virtual cursor to target coordinates.",
+                    "description": "Smoothly glide the virtual cursor to target coordinates with automatic PiP oversight.",
                     "inputSchema": [
                         "type": "object",
                         "properties": [
                             "x": ["type": "number"],
-                            "y": ["type": "number"]
+                            "y": ["type": "number"],
+                            "app": ["type": "string", "description": "Optional target application name"],
+                            "window": ["type": "integer", "description": "Optional target window ID"]
                         ],
                         "required": ["x", "y"]
                     ]
@@ -4335,6 +4697,7 @@ func runMCPServer() {
                         "properties": [
                             "output": ["type": "string", "default": "/tmp/mcu_screen.png"],
                             "window": ["type": "integer"],
+                            "app": ["type": "string"],
                             "rect": ["type": "string"]
                         ]
                     ]
@@ -4366,7 +4729,7 @@ func runMCPServer() {
                 ],
                 [
                     "name": "click_text",
-                    "description": "Semantically find and click text inside a background window or on screen using Apple Vision OCR with virtual cursor animation and zero user disruption.",
+                    "description": "Semantically find and click text inside a background window or on screen using Apple Vision OCR with automatic PiP oversight, virtual cursor animation, and zero user disruption.",
                     "inputSchema": [
                         "type": "object",
                         "properties": [
@@ -4375,14 +4738,14 @@ func runMCPServer() {
                             "window": ["type": "integer", "description": "Target window ID"],
                             "button": ["type": "string", "enum": ["left", "right", "middle"], "default": "left"],
                             "count": ["type": "integer", "default": 1],
-                            "done": ["type": "boolean", "description": "Automatically clean up after click", "default": false]
+                            "done": ["type": "boolean", "description": "Also dismiss virtual cursor overlay after automatic PiP exit", "default": false]
                         ],
                         "required": ["query"]
                     ]
                 ],
                 [
                     "name": "scroll",
-                    "description": "Scroll wheel delta in a background window or at specific coordinates without stealing focus.",
+                    "description": "Scroll wheel delta in a background window or at specific coordinates with automatic PiP oversight and without stealing focus.",
                     "inputSchema": [
                         "type": "object",
                         "properties": [
@@ -4399,7 +4762,7 @@ func runMCPServer() {
                 ],
                 [
                     "name": "select_range",
-                    "description": "Select a range of text or perform a drag selection in a background window without stealing focus.",
+                    "description": "Select a range of text or perform a drag selection in a background window with automatic PiP oversight and without stealing focus.",
                     "inputSchema": [
                         "type": "object",
                         "properties": [
@@ -4475,36 +4838,45 @@ func runMCPServer() {
                 ]
             ]
             sendMCPResponse(resp)
-            
+
         case "tools/call":
             let params = json["params"] as? [String: Any] ?? [:]
             let toolName = params["name"] as? String ?? ""
             let toolArgs = params["arguments"] as? [String: Any] ?? [:]
-            let resultText = handleMCPToolCall(name: toolName, args: toolArgs)
-            let resp: [String: Any] = [
-                "jsonrpc": "2.0",
-                "id": id ?? 1,
-                "result": [
-                    "content": [
-                        [
-                            "type": "text",
-                            "text": resultText
-                        ]
+            let toolRes = handleMCPToolCall(name: toolName, args: toolArgs)
+            var resultObj: [String: Any] = [
+                "content": [
+                    [
+                        "type": "text",
+                        "text": toolRes.text
                     ]
                 ]
             ]
-            sendMCPResponse(resp)
-            
-        default:
+            if toolRes.isError {
+                resultObj["isError"] = true
+            }
             let resp: [String: Any] = [
                 "jsonrpc": "2.0",
                 "id": id ?? 1,
-                "error": [
-                    "code": -32601,
-                    "message": "Method not found: \(method)"
-                ]
+                "result": resultObj
             ]
             sendMCPResponse(resp)
+
+        default:
+            if method.hasPrefix("notifications/") && id == nil {
+                break
+            }
+            if let reqID = id {
+                let resp: [String: Any] = [
+                    "jsonrpc": "2.0",
+                    "id": reqID,
+                    "error": [
+                        "code": -32601,
+                        "message": "Method not found: \(method)"
+                    ]
+                ]
+                sendMCPResponse(resp)
+            }
         }
     }
 }
@@ -4549,8 +4921,13 @@ case "ocr":
         }
         i += 1
     }
-    if targetWID == nil, let app = targetApp {
-        targetWID = PiPWindowController.firstWindowID(matchingApp: app)
+    if targetApp != nil || targetWID != nil {
+        let resolved = resolveExplicitTarget(appName: targetApp, windowID: targetWID, requireWindow: true)
+        if let err = resolved.error {
+            fputs(err + "\n", stderr)
+            exit(1)
+        }
+        targetWID = resolved.windowID
     }
     guard let capture = (targetWID != nil ? VisionOCREngine.captureWindowImage(windowID: targetWID!) : VisionOCREngine.captureScreenImage()) else {
         fputs("Error: Failed to capture target image for OCR\n", stderr)
@@ -4604,6 +4981,10 @@ case "click":
             i += 1
         }
         let res = clickText(query: query, appName: targetApp, windowID: targetWID, button: btn, clickCount: count, autoClean: autoClean)
+        if !res.success {
+            fputs(res.message + "\n", stderr)
+            exit(1)
+        }
         print(res.message)
     } else {
         print("Use: mcu click text <query> or mcu mouse click <x> <y>")
@@ -4621,26 +5002,26 @@ case "select":
         }
         var targetApp: String? = nil
         var targetPID: pid_t? = nil
+        var targetWID: CGWindowID? = nil
         var autoClean = false
         var i = 7
         while i < args.count {
             if args[i] == "--app", i + 1 < args.count { targetApp = args[i + 1]; i += 1 }
             else if args[i] == "--pid", i + 1 < args.count { if let p = Int32(args[i + 1]) { targetPID = p }; i += 1 }
             else if (args[i] == "--window" || args[i] == "--wid"), i + 1 < args.count {
-                if let wid = Int(args[i + 1]) {
-                    let wins = getWindowsList(allLayers: true)
-                    if let win = wins.first(where: { ($0["id"] as? Int) == wid }),
-                       let p = (win["pid"] as? Int) ?? (win["pid"] as? Int32).map(Int.init) {
-                        targetPID = pid_t(p)
-                    }
-                }
+                if let wid = Int(args[i + 1]) { targetWID = CGWindowID(wid) }
                 i += 1
             } else if args[i] == "--done" || args[i] == "--clean" {
                 autoClean = true
             }
             i += 1
         }
-        selectRangeAction(from: CGPoint(x: x1, y: y1), to: CGPoint(x: x2, y: y2), targetPID: targetPID, appName: targetApp, autoClean: autoClean)
+        let resolved = resolveExplicitTarget(appName: targetApp, windowID: targetWID, pid: targetPID)
+        if let err = resolved.error {
+            fputs(err + "\n", stderr)
+            exit(1)
+        }
+        selectRangeAction(from: CGPoint(x: x1, y: y1), to: CGPoint(x: x2, y: y2), targetPID: resolved.pid, windowID: resolved.windowID, appName: targetApp, autoClean: autoClean)
     } else {
         print("Usage: mcu select range <x1> <y1> <x2> <y2>")
     }
@@ -4661,18 +5042,31 @@ case "cursor":
         print("Fancy virtual cursor overlay terminated.")
     case "move":
         guard args.count >= 5, let x = Double(args[3]), let y = Double(args[4]) else {
-            fputs("Usage: mcu cursor move <x> <y> [--speed slow|normal|fast] [--duration <sec>]\n", stderr)
+            fputs("Usage: mcu cursor move <x> <y> [--speed slow|normal|fast] [--duration <sec>] [--app <name>] [--window <wid>]\n", stderr)
             exit(1)
         }
         var speed: String? = nil
         var dur: Double? = nil
+        var targetApp: String? = nil
+        var targetWID: CGWindowID? = nil
         var i = 5
         while i < args.count {
             if args[i] == "--speed", i + 1 < args.count { speed = args[i + 1]; i += 1 }
             else if args[i] == "--duration", i + 1 < args.count { dur = Double(args[i + 1]); i += 1 }
+            else if args[i] == "--app", i + 1 < args.count { targetApp = args[i + 1]; i += 1 }
+            else if (args[i] == "--window" || args[i] == "--wid"), i + 1 < args.count {
+                if let w = Int(args[i + 1]) { targetWID = CGWindowID(w) }
+                i += 1
+            }
             i += 1
         }
-        moveMouseVirtual(to: CGPoint(x: x, y: y), speed: speed, duration: dur)
+        let resolved = resolveExplicitTarget(appName: targetApp, windowID: targetWID)
+        if let err = resolved.error {
+            fputs(err + "\n", stderr)
+            exit(1)
+        }
+        let moveRes = moveMouseVirtual(to: CGPoint(x: x, y: y), speed: speed, duration: dur, windowID: resolved.windowID, appName: targetApp, targetPID: resolved.pid)
+        if !moveRes.success { exit(1) }
     case "done":
         VirtualCursorClient.done()
         print("Agent control completed. Virtual cursor and PiP window dismissed.")
@@ -4714,8 +5108,17 @@ case "pip":
             else if args[i] == "--anchor-pid", i + 1 < args.count { anchorPID = pid_t(args[i + 1]); i += 1 }
             i += 1
         }
-        VirtualCursorClient.pipShow(appName: app, windowID: wid, anchorPID: anchorPID)
-        print("PiP live preview activated for '\(app ?? (wid != nil ? "Window \(wid!)" : "Active Window"))'")
+        var resolvedWID = wid
+        if app != nil || wid != nil {
+            let resolved = resolveExplicitTarget(appName: app, windowID: wid.map { CGWindowID($0) }, requireWindow: true)
+            if let err = resolved.error {
+                fputs(err + "\n", stderr)
+                exit(1)
+            }
+            resolvedWID = resolved.windowID.map(Int.init)
+        }
+        VirtualCursorClient.pipShow(appName: app, windowID: resolvedWID, anchorPID: anchorPID)
+        print("PiP live preview activated for '\(app ?? (resolvedWID != nil ? "Window \(resolvedWID!)" : "Active Window"))'")
     case "hide", "stop", "close":
         var wid: Int? = nil
         if let i = args.firstIndex(where: { $0 == "--window" || $0 == "--window-id" }), i + 1 < args.count { wid = Int(args[i + 1]) }
@@ -4793,8 +5196,9 @@ case "screen":
         var withGrid = false
         var withCursor = false
         var windowID: CGWindowID? = nil
+        var targetApp: String? = nil
         var rect: CGRect? = nil
-        
+
         var i = 3
         while i < args.count {
             switch args[i] {
@@ -4810,8 +5214,7 @@ case "screen":
                 if i + 1 < args.count, let wid = UInt32(args[i + 1]) { windowID = wid; i += 1 }
             case "--app":
                 if i + 1 < args.count {
-                    let appName = args[i + 1]
-                    windowID = PiPWindowController.firstWindowID(matchingApp: appName)
+                    targetApp = args[i + 1]
                     i += 1
                 }
             case "--rect":
@@ -4827,7 +5230,18 @@ case "screen":
             }
             i += 1
         }
-        captureScreen(output: output, scale1x: scale1x, withGrid: withGrid, windowID: windowID, rect: rect, includeCursor: withCursor)
+        if targetApp != nil || windowID != nil {
+            let resolved = resolveExplicitTarget(appName: targetApp, windowID: windowID, requireWindow: true)
+            if let err = resolved.error {
+                fputs(err + "\n", stderr)
+                exit(1)
+            }
+            windowID = resolved.windowID
+        }
+        let capRes = captureScreen(output: output, scale1x: scale1x, withGrid: withGrid, windowID: windowID, rect: rect, includeCursor: withCursor)
+        if !capRes.success {
+            exit(1)
+        }
     default:
         printUsage()
     }
@@ -4871,14 +5285,23 @@ case "window":
             }
             i += 1
         }
-        if targetWID == nil, let app = targetApp {
-            targetWID = PiPWindowController.firstWindowID(matchingApp: app)
-        }
-        guard let wid = targetWID else {
+        guard targetWID != nil || targetApp != nil else {
             fputs("Error: Must specify a target window ID or application name (e.g. mcu window capture --app <name> or mcu window capture <wid>)\n", stderr)
             exit(1)
         }
-        captureScreen(output: output, scale1x: scale1x, withGrid: false, windowID: wid, rect: nil, includeCursor: false)
+        let resolved = resolveExplicitTarget(appName: targetApp, windowID: targetWID, requireWindow: true)
+        if let err = resolved.error {
+            fputs(err + "\n", stderr)
+            exit(1)
+        }
+        guard let wid = resolved.windowID else {
+            fputs("Error: Could not find window\n", stderr)
+            exit(1)
+        }
+        let capRes = captureScreen(output: output, scale1x: scale1x, withGrid: false, windowID: wid, rect: nil, includeCursor: false)
+        if !capRes.success {
+            exit(1)
+        }
         print("Captured background window \(wid) to \(output) [Overshadowed background isolated]")
     case "focus":
         guard args.count >= 4 else {
@@ -4936,7 +5359,10 @@ case "window":
             }
             i += 1
         }
-        resizeWindowWithVirtualCursor(windowID: wid, targetWidth: targetW, targetHeight: targetH, duration: dur)
+        let resizeRes = resizeWindowWithVirtualCursor(windowID: wid, targetWidth: targetW, targetHeight: targetH, duration: dur)
+        if !resizeRes.success {
+            exit(1)
+        }
     default:
         printUsage()
     }
@@ -4956,7 +5382,8 @@ case "ax":
             i += 1
         }
         guard let appEl = getAppElement(appName: appName, pid: pid) else {
-            fputs("Error: Could not locate target application\n", stderr)
+            let desc = appName.map { "application '\($0)'" } ?? (pid.map { "PID \($0)" } ?? "target application")
+            fputs("Error: Could not locate \(desc)\n", stderr)
             exit(1)
         }
         if let dict = axElementToDict(appEl, depth: 0, maxDepth: maxDepth),
@@ -4981,7 +5408,8 @@ case "ax":
             i += 1
         }
         guard let appEl = getAppElement(appName: appName, pid: pid) else {
-            fputs("Error: Could not locate target application\n", stderr)
+            let desc = appName.map { "application '\($0)'" } ?? (pid.map { "PID \($0)" } ?? "target application")
+            fputs("Error: Could not locate \(desc)\n", stderr)
             exit(1)
         }
         var results: [[String: Any]] = []
@@ -5015,7 +5443,8 @@ case "ax":
         }
         
         guard let appEl = getAppElement(appName: appName, pid: pid) else {
-            fputs("Error: Target application not found\n", stderr)
+            let desc = appName.map { "application '\($0)'" } ?? (pid.map { "PID \($0)" } ?? "target application")
+            fputs("Error: Could not locate \(desc)\n", stderr)
             exit(1)
         }
         
@@ -5027,10 +5456,20 @@ case "ax":
             if let t = title, !t.isEmpty, !elTitle.localizedCaseInsensitiveContains(t) { match = false }
             
             if match && (role != nil || title != nil) {
-                // If element has a frame, show our fancy cursor gliding over!
                 if let frame = getElementFrame(el) {
                     let center = CGPoint(x: frame.origin.x + frame.size.width / 2.0, y: frame.origin.y + frame.size.height / 2.0)
-                    VirtualCursorClient.click(at: center, button: "left")
+                    return withAutoPiP(appName: appName, pid: pid, point: center) {
+                        VirtualCursorClient.move(to: center, speed: "normal")
+                        usleep(220000)
+                        VirtualCursorClient.click(at: center, button: "left")
+                        let err = AXUIElementPerformAction(el, kAXPressAction as CFString)
+                        if err == .success {
+                            AccessControlEngine.logAudit(action: "ax_click", targetApp: appName, details: "Role='\(elRole)', Title='\(elTitle)'")
+                            print("Pressed element via AXPress: Role='\(elRole)', Title='\(elTitle)' [Hardware mouse never moved!]")
+                            return true
+                        }
+                        return false
+                    }
                 }
                 
                 let err = AXUIElementPerformAction(el, kAXPressAction as CFString)
@@ -5101,20 +5540,34 @@ case "mouse":
         guard args.count >= 5,
               let x = Double(args[3]),
               let y = Double(args[4]) else {
-            fputs("Usage: mcu mouse move <x> <y> [--speed slow|normal|fast] [--duration <sec>]\n", stderr)
+            fputs("Usage: mcu mouse move <x> <y> [--speed slow|normal|fast] [--duration <sec>] [--app <name>] [--window <wid>] [--pid <pid>]\n", stderr)
             exit(1)
         }
         var speed: String? = nil
         var dur: Double? = nil
+        var targetApp: String? = nil
+        var targetWID: CGWindowID? = nil
+        var targetPID: pid_t? = nil
         var i = 5
         while i < args.count {
             if args[i] == "--speed", i + 1 < args.count { speed = args[i + 1]; i += 1 }
             else if args[i] == "--duration", i + 1 < args.count { dur = Double(args[i + 1]); i += 1 }
+            else if args[i] == "--app", i + 1 < args.count { targetApp = args[i + 1]; i += 1 }
+            else if args[i] == "--pid", i + 1 < args.count { if let p = Int32(args[i + 1]) { targetPID = p }; i += 1 }
+            else if (args[i] == "--window" || args[i] == "--wid"), i + 1 < args.count {
+                if let w = Int(args[i + 1]) { targetWID = CGWindowID(w) }
+                i += 1
+            }
             i += 1
         }
-        // Move the fancy virtual cursor!
-        moveMouseVirtual(to: CGPoint(x: x, y: y), speed: speed, duration: dur)
-        
+        let resolved = resolveExplicitTarget(appName: targetApp, windowID: targetWID, pid: targetPID)
+        if let err = resolved.error {
+            fputs(err + "\n", stderr)
+            exit(1)
+        }
+        let moveRes = moveMouseVirtual(to: CGPoint(x: x, y: y), speed: speed, duration: dur, windowID: resolved.windowID, appName: targetApp, targetPID: resolved.pid)
+        if !moveRes.success { exit(1) }
+
     case "click":
         var x: Double? = nil
         var y: Double? = nil
@@ -5122,12 +5575,14 @@ case "mouse":
         var count = 1
         var restoreCursor = true
         var targetPID: pid_t? = nil
+        var targetWID: CGWindowID? = nil
+        var targetApp: String? = nil
         var autoClean = false
-        
+
         var i = 3
         if i < args.count, let px = Double(args[i]) { x = px; i += 1 }
         if i < args.count, let py = Double(args[i]) { y = py; i += 1 }
-        
+
         while i < args.count {
             if args[i] == "--button", i + 1 < args.count {
                 switch args[i + 1].lowercased() {
@@ -5146,57 +5601,73 @@ case "mouse":
             } else if args[i] == "--pid", i + 1 < args.count {
                 if let p = Int32(args[i + 1]) { targetPID = p }
                 i += 1
-            } else if args[i] == "--window", i + 1 < args.count {
-                if let wid = Int(args[i + 1]) {
-                    let wins = getWindowsList(allLayers: true)
-                    if let win = wins.first(where: { ($0["id"] as? Int) == wid }),
-                       let p = (win["pid"] as? Int) ?? (win["pid"] as? Int32).map(Int.init) {
-                        targetPID = pid_t(p)
-                    }
-                }
+            } else if (args[i] == "--window" || args[i] == "--wid"), i + 1 < args.count {
+                if let w = Int(args[i + 1]) { targetWID = CGWindowID(w) }
                 i += 1
             } else if args[i] == "--app", i + 1 < args.count {
-                let appName = args[i + 1]
-                let apps = NSWorkspace.shared.runningApplications
-                if let match = apps.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(appName) == true }) {
-                    targetPID = match.processIdentifier
-                }
+                targetApp = args[i + 1]
                 i += 1
             }
             i += 1
         }
+        let resolved = resolveExplicitTarget(appName: targetApp, windowID: targetWID, pid: targetPID)
+        if let err = resolved.error {
+            fputs(err + "\n", stderr)
+            exit(1)
+        }
         let pt = (x != nil && y != nil) ? CGPoint(x: x!, y: y!) : nil
-        clickMouseNonDisruptive(at: pt, button: btn, clickCount: count, restoreCursor: restoreCursor, targetPID: targetPID)
+        let clickRes = clickMouseNonDisruptive(at: pt, button: btn, clickCount: count, restoreCursor: restoreCursor, targetPID: resolved.pid, windowID: resolved.windowID, appName: targetApp)
         if autoClean {
-            usleep(300000)
             VirtualCursorClient.done()
         }
-        
+        if !clickRes.success { exit(1) }
+
     case "drag":
         guard args.count >= 7,
               let x1 = Double(args[3]),
               let y1 = Double(args[4]),
               let x2 = Double(args[5]),
               let y2 = Double(args[6]) else {
-            fputs("Usage: mcu mouse drag <x1> <y1> <x2> <y2> [--duration <sec>] [--no-restore]\n", stderr)
+            fputs("Usage: mcu mouse drag <x1> <y1> <x2> <y2> [--duration <sec>] [--no-restore] [--app <name>] [--window <wid>] [--pid <pid>] [--done]\n", stderr)
             exit(1)
         }
         var dur = 0.4
         var restore = true
+        var targetPID: pid_t? = nil
+        var targetWID: CGWindowID? = nil
+        var targetApp: String? = nil
+        var autoClean = false
         var i = 7
         while i < args.count {
             if args[i] == "--duration", i + 1 < args.count { dur = Double(args[i + 1]) ?? 0.4; i += 1 }
             else if args[i] == "--no-restore" { restore = false }
+            else if args[i] == "--done" || args[i] == "--clean" { autoClean = true }
+            else if args[i] == "--pid", i + 1 < args.count { if let p = Int32(args[i + 1]) { targetPID = p }; i += 1 }
+            else if (args[i] == "--window" || args[i] == "--wid"), i + 1 < args.count {
+                if let w = Int(args[i + 1]) { targetWID = CGWindowID(w) }
+                i += 1
+            } else if args[i] == "--app", i + 1 < args.count { targetApp = args[i + 1]; i += 1 }
             i += 1
         }
-        dragMouse(from: CGPoint(x: x1, y: y1), to: CGPoint(x: x2, y: y2), duration: dur, restoreCursor: restore)
-        
+        let resolved = resolveExplicitTarget(appName: targetApp, windowID: targetWID, pid: targetPID)
+        if let err = resolved.error {
+            fputs(err + "\n", stderr)
+            exit(1)
+        }
+        let dragRes = dragMouse(from: CGPoint(x: x1, y: y1), to: CGPoint(x: x2, y: y2), duration: dur, restoreCursor: restore, targetPID: resolved.pid, windowID: resolved.windowID, appName: targetApp)
+        if autoClean {
+            VirtualCursorClient.done()
+        }
+        if !dragRes.success { exit(1) }
+
     case "scroll":
         var dy: Int32 = 0
         var dx: Int32 = 0
         var x: Double? = nil
         var y: Double? = nil
         var targetPID: pid_t? = nil
+        var targetWID: CGWindowID? = nil
+        var targetApp: String? = nil
         var autoClean = false
         var i = 3
         if i < args.count, let v = Int32(args[i]) {
@@ -5214,33 +5685,28 @@ case "mouse":
             else if args[i] == "--x", i + 1 < args.count { x = Double(args[i + 1]); i += 1 }
             else if args[i] == "--y", i + 1 < args.count { y = Double(args[i + 1]); i += 1 }
             else if args[i] == "--pid", i + 1 < args.count { if let p = Int32(args[i + 1]) { targetPID = p }; i += 1 }
-            else if args[i] == "--window", i + 1 < args.count {
-                if let wid = Int(args[i + 1]) {
-                    let wins = getWindowsList(allLayers: true)
-                    if let win = wins.first(where: { ($0["id"] as? Int) == wid }),
-                       let p = (win["pid"] as? Int) ?? (win["pid"] as? Int32).map(Int.init) {
-                        targetPID = pid_t(p)
-                    }
-                }
+            else if (args[i] == "--window" || args[i] == "--wid"), i + 1 < args.count {
+                if let w = Int(args[i + 1]) { targetWID = CGWindowID(w) }
                 i += 1
             } else if args[i] == "--app", i + 1 < args.count {
-                let appName = args[i + 1]
-                let apps = NSWorkspace.shared.runningApplications
-                if let match = apps.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(appName) == true }) {
-                    targetPID = match.processIdentifier
-                }
+                targetApp = args[i + 1]
                 i += 1
             } else if args[i] == "--done" || args[i] == "--clean" {
                 autoClean = true
             }
             i += 1
         }
+        let resolved = resolveExplicitTarget(appName: targetApp, windowID: targetWID, pid: targetPID)
+        if let err = resolved.error {
+            fputs(err + "\n", stderr)
+            exit(1)
+        }
         let pt = (x != nil && y != nil) ? CGPoint(x: x!, y: y!) : nil
-        scrollWheel(dx: dx, dy: dy, at: pt, targetPID: targetPID)
+        let scrollRes = scrollWheel(dx: dx, dy: dy, at: pt, targetPID: resolved.pid, windowID: resolved.windowID, appName: targetApp)
         if autoClean {
-            usleep(250000)
             VirtualCursorClient.done()
         }
+        if !scrollRes.success { exit(1) }
     default:
         printUsage()
     }
@@ -5254,6 +5720,8 @@ case "keyboard":
             exit(1)
         }
         var targetPID: pid_t? = nil
+        var targetWID: CGWindowID? = nil
+        var targetApp: String? = nil
         var textTokens: [String] = []
         var i = 3
         while i < args.count {
@@ -5261,28 +5729,23 @@ case "keyboard":
                 if let p = Int32(args[i + 1]) { targetPID = p }
                 i += 1
             } else if args[i] == "--window", i + 1 < args.count {
-                if let wid = Int(args[i + 1]) {
-                    let wins = getWindowsList(allLayers: true)
-                    if let win = wins.first(where: { ($0["id"] as? Int) == wid }),
-                       let p = (win["pid"] as? Int) ?? (win["pid"] as? Int32).map(Int.init) {
-                        targetPID = pid_t(p)
-                    }
-                }
+                if let w = Int(args[i + 1]) { targetWID = CGWindowID(w) }
                 i += 1
             } else if args[i] == "--app", i + 1 < args.count {
-                let appName = args[i + 1]
-                let apps = NSWorkspace.shared.runningApplications
-                if let match = apps.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(appName) == true }) {
-                    targetPID = match.processIdentifier
-                }
+                targetApp = args[i + 1]
                 i += 1
             } else {
                 textTokens.append(args[i])
             }
             i += 1
         }
+        let resolved = resolveExplicitTarget(appName: targetApp, windowID: targetWID, pid: targetPID)
+        if let err = resolved.error {
+            fputs(err + "\n", stderr)
+            exit(1)
+        }
         let text = textTokens.joined(separator: " ")
-        typeString(text, targetPID: targetPID)
+        typeString(text, targetPID: resolved.pid)
     case "key":
         guard args.count >= 4 else {
             fputs("Usage: mcu keyboard key <name> [--app <name>] [--window <wid>] [--pid <pid>]\n", stderr)
@@ -5294,33 +5757,30 @@ case "keyboard":
             exit(1)
         }
         var targetPID: pid_t? = nil
+        var targetWID: CGWindowID? = nil
+        var targetApp: String? = nil
         var i = 4
         while i < args.count {
             if args[i] == "--pid", i + 1 < args.count {
                 if let p = Int32(args[i + 1]) { targetPID = p }
                 i += 1
             } else if args[i] == "--window", i + 1 < args.count {
-                if let wid = Int(args[i + 1]) {
-                    let wins = getWindowsList(allLayers: true)
-                    if let win = wins.first(where: { ($0["id"] as? Int) == wid }),
-                       let p = (win["pid"] as? Int) ?? (win["pid"] as? Int32).map(Int.init) {
-                        targetPID = pid_t(p)
-                    }
-                }
+                if let w = Int(args[i + 1]) { targetWID = CGWindowID(w) }
                 i += 1
             } else if args[i] == "--app", i + 1 < args.count {
-                let appName = args[i + 1]
-                let apps = NSWorkspace.shared.runningApplications
-                if let match = apps.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(appName) == true }) {
-                    targetPID = match.processIdentifier
-                }
+                targetApp = args[i + 1]
                 i += 1
             }
             i += 1
         }
-        pressKey(keyCode: code, targetPID: targetPID)
+        let resolved = resolveExplicitTarget(appName: targetApp, windowID: targetWID, pid: targetPID)
+        if let err = resolved.error {
+            fputs(err + "\n", stderr)
+            exit(1)
+        }
+        pressKey(keyCode: code, targetPID: resolved.pid)
         AccessControlEngine.logAudit(action: "keyboard_key", details: keyName)
-        print("Pressed key '\(keyName)' \(targetPID != nil ? "[Target PID: \(targetPID!)] (Overshadowed background delivery)" : "")")
+        print("Pressed key '\(keyName)' \(resolved.pid != nil ? "[Target PID: \(resolved.pid!)] (Overshadowed background delivery)" : "")")
     case "hotkey":
         guard args.count >= 4 else {
             fputs("Usage: mcu keyboard hotkey <combo> [--app <name>] [--window <wid>] [--pid <pid>]\n", stderr)
@@ -5328,31 +5788,28 @@ case "keyboard":
         }
         let combo = args[3]
         var targetPID: pid_t? = nil
+        var targetWID: CGWindowID? = nil
+        var targetApp: String? = nil
         var i = 4
         while i < args.count {
             if args[i] == "--pid", i + 1 < args.count {
                 if let p = Int32(args[i + 1]) { targetPID = p }
                 i += 1
             } else if args[i] == "--window", i + 1 < args.count {
-                if let wid = Int(args[i + 1]) {
-                    let wins = getWindowsList(allLayers: true)
-                    if let win = wins.first(where: { ($0["id"] as? Int) == wid }),
-                       let p = (win["pid"] as? Int) ?? (win["pid"] as? Int32).map(Int.init) {
-                        targetPID = pid_t(p)
-                    }
-                }
+                if let w = Int(args[i + 1]) { targetWID = CGWindowID(w) }
                 i += 1
             } else if args[i] == "--app", i + 1 < args.count {
-                let appName = args[i + 1]
-                let apps = NSWorkspace.shared.runningApplications
-                if let match = apps.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(appName) == true }) {
-                    targetPID = match.processIdentifier
-                }
+                targetApp = args[i + 1]
                 i += 1
             }
             i += 1
         }
-        triggerHotkeyCombo(combo, targetPID: targetPID)
+        let resolved = resolveExplicitTarget(appName: targetApp, windowID: targetWID, pid: targetPID)
+        if let err = resolved.error {
+            fputs(err + "\n", stderr)
+            exit(1)
+        }
+        triggerHotkeyCombo(combo, targetPID: resolved.pid)
     default:
         printUsage()
     }
@@ -5393,8 +5850,7 @@ case "browser":
             i += 1
         }
         
-        let apps = NSWorkspace.shared.runningApplications
-        let isRunning = apps.contains(where: { $0.localizedName?.localizedCaseInsensitiveContains(appName) == true })
+        let isRunning = findRunningApplication(matching: appName) != nil
         if !isRunning {
             let config = NSWorkspace.OpenConfiguration()
             config.activates = false
@@ -5404,12 +5860,12 @@ case "browser":
                 sleep(2)
             }
         }
-        
-        if isPrivate, let match = NSWorkspace.shared.runningApplications.first(where: { $0.localizedName?.localizedCaseInsensitiveContains(appName) == true }) {
+
+        if isPrivate, let match = findRunningApplication(matching: appName) {
             triggerHotkeyCombo("cmd+shift+n", targetPID: match.processIdentifier)
             usleep(600000)
         }
-        
+
         if appName.localizedCaseInsensitiveContains("Safari") {
             let script = "tell application \"Safari\" to set URL of current tab of front window to \"\(url)\""
             var error: NSDictionary?
@@ -5417,7 +5873,8 @@ case "browser":
                 appleScript.executeAndReturnError(&error)
             }
         }
-        VirtualCursorClient.pipShow(appName: appName, windowID: nil)
+        let browserWID = PiPWindowController.firstWindowID(matchingApp: appName)
+        VirtualCursorClient.pipShow(appName: appName, windowID: browserWID.map(Int.init))
         print("Opened \(url) in \(appName) \(isPrivate ? "(Private Browsing) " : "")[Zero focus stolen, PiP oversight active]")
     default:
         printUsage()
