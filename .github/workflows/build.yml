@@ -1,0 +1,168 @@
+name: Build & Optional Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Publish a GitHub Release after building"
+        required: true
+        type: boolean
+        default: false
+      bump:
+        description: "Auto-increment SemVer part (when creating a release with no custom tag)"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+      tag_override:
+        description: "Optional explicit tag override (e.g. v1.0.0); leave blank to auto-generate"
+        required: false
+        type: string
+        default: ""
+      prerelease:
+        description: "Mark the release as a pre-release"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Universal macOS Binary (arm64 + x86_64)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version & release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OVERRIDE="${{ inputs.tag_override }}"
+          BUMP="${{ inputs.bump }}"
+
+          if [[ -n "$OVERRIDE" ]]; then
+            TAG="$OVERRIDE"
+            [[ "$TAG" == v* ]] || TAG="v$TAG"
+          else
+            LATEST_TAG="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1 || true)"
+            if [[ -z "$LATEST_TAG" ]]; then
+              TAG="v0.1.0"
+            else
+              BASE="${LATEST_TAG#v}"
+              BASE="${BASE%%-*}"
+              IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE"
+              case "$BUMP" in
+                major)
+                  MAJOR=$((MAJOR + 1))
+                  MINOR=0
+                  PATCH=0
+                  ;;
+                minor)
+                  MINOR=$((MINOR + 1))
+                  PATCH=0
+                  ;;
+                patch|*)
+                  PATCH=$((PATCH + 1))
+                  ;;
+              esac
+              TAG="v${MAJOR}.${MINOR}.${PATCH}"
+            fi
+          fi
+
+          if [[ "${{ inputs.prerelease }}" == "true" && "$TAG" != *-* ]]; then
+            SHORT_SHA="$(git rev-parse --short HEAD)"
+            TAG="${TAG}-rc.${SHORT_SHA}"
+          fi
+
+          VERSION="${TAG#v}"
+          TITLE="macOS Computer Use (mcu) ${TAG}"
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "title=${TITLE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${VERSION} | Tag: ${TAG} | Title: ${TITLE}"
+
+      - name: Compile Universal macOS binary (arm64 + x86_64)
+        run: |
+          set -euo pipefail
+          mkdir -p dist/bin scripts/bin
+
+          swiftc -O -target arm64-apple-macosx13.0 scripts/macos_control.swift -o dist/bin/mcu-arm64
+          swiftc -O -target x86_64-apple-macosx13.0 scripts/macos_control.swift -o dist/bin/mcu-x86_64
+          lipo -create dist/bin/mcu-arm64 dist/bin/mcu-x86_64 -output scripts/bin/mcu
+          chmod +x scripts/bin/mcu
+
+          file scripts/bin/mcu
+          ./scripts/bin/mcu screen info > /dev/null || true
+
+      - name: Package release bundle & checksums
+        id: pkg
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          ARCHIVE="mcu-v${VERSION}-macos-universal.tar.gz"
+          STAGE="dist/macos-computer-use"
+
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/scripts/bin" "$STAGE/logs"
+          cp scripts/bin/mcu "$STAGE/scripts/bin/mcu"
+          cp scripts/build.sh scripts/macos_shot.sh scripts/macos_interact.sh scripts/macos_screenshare.sh "$STAGE/scripts/" 2>/dev/null || true
+          cp -R config resources examples references SKILL.md README.md "$STAGE/"
+          chmod +x "$STAGE/scripts/"*.sh "$STAGE/scripts/bin/mcu"
+
+          tar -C dist -czf "dist/${ARCHIVE}" macos-computer-use
+          (cd dist && shasum -a 256 "${ARCHIVE}" > "SHA256SUMS.txt")
+
+          echo "archive=dist/${ARCHIVE}" >> "$GITHUB_OUTPUT"
+          echo "checksums=dist/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcu-v${{ steps.meta.outputs.version }}-macos-universal
+          path: |
+            ${{ steps.pkg.outputs.archive }}
+            ${{ steps.pkg.outputs.checksums }}
+          if-no-files-found: error
+
+      - name: Create Git tag & publish GitHub Release
+        if: ${{ inputs.create_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          TITLE="${{ steps.meta.outputs.title }}"
+          ARCHIVE="${{ steps.pkg.outputs.archive }}"
+          CHECKSUMS="${{ steps.pkg.outputs.checksums }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            git tag -a "$TAG" -m "$TITLE"
+            git push origin "$TAG"
+          fi
+
+          PRERELEASE_FLAG=""
+          if [[ "${{ inputs.prerelease }}" == "true" ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          gh release create "$TAG" \
+            "$ARCHIVE" \
+            "$CHECKSUMS" \
+            --title "$TITLE" \
+            --generate-notes \
+            $PRERELEASE_FLAG

@@ -1,0 +1,6 @@
+.DS_Store
+*.stable_backup*
+logs/
+scripts/bin/
+.build/
+dist/

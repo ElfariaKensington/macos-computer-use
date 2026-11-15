@@ -1,0 +1,43 @@
+{
+  "version": "1.0",
+  "policy": {
+    "mode": "enforcing",
+    "description": "Multi-tier security, geofencing, app boundaries, and non-disruptive execution controls",
+    "blocked_apps": [
+      "Keychain Access",
+      "Passwords",
+      "1Password",
+      "Bitwarden",
+      "KeePassXC",
+      "Enpass",
+      "Disk Utility"
+    ],
+    "allowed_apps": [
+      "*"
+    ],
+    "blocked_screen_regions": [],
+    "allowed_screen_regions": [],
+    "blocked_hotkeys": [
+      "cmd+opt+esc",
+      "cmd+shift+delete",
+      "cmd+ctrl+q"
+    ],
+    "rate_limiting": {
+      "enabled": true,
+      "max_actions_per_minute": 180,
+      "min_delay_ms": 25
+    },
+    "non_disruptive": {
+      "restore_user_cursor": true,
+      "virtual_cursor_enabled": true,
+      "prevent_focus_steal": true
+    },
+    "kill_switch": {
+      "lock_file": "/tmp/mcu_kill.lock"
+    },
+    "audit_logging": {
+      "enabled": true,
+      "log_path": "~/.gemini/config/skills/macos-computer-use/logs/audit.jsonl"
+    }
+  }
+}
