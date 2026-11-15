@@ -126,6 +126,50 @@ func cursorDaemonPID() -> pid_t? {
     return p
 }
 
+let kPiPLastErrorPath = "/tmp/mcu_last_pip_error.txt"
+
+func isMenuBarStrip(_ win: [String: Any]) -> Bool {
+    guard let b = win["bounds"] as? [String: CGFloat] else { return false }
+    let w = b["width"] ?? 0
+    let h = b["height"] ?? 0
+    let y = b["y"] ?? 0
+    return h <= 45 && w >= 600 && y <= 5
+}
+
+func pickSubstantiveWindow(from subset: [[String: Any]], matchingHint hint: String? = nil) -> [String: Any]? {
+    let substantial = subset.filter { win in
+        guard !isMenuBarStrip(win), let b = win["bounds"] as? [String: CGFloat] else { return false }
+        return (b["width"] ?? 0) >= 200 && (b["height"] ?? 0) >= 150
+    }
+    if !substantial.isEmpty {
+        if let hint, !hint.isEmpty,
+           let hintTitled = substantial.first(where: { win in
+               let title = (win["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+               let b = win["bounds"] as? [String: CGFloat]
+               return !title.isEmpty &&
+                   title.localizedCaseInsensitiveContains(hint) &&
+                   (b?["width"] ?? 0) >= 320 && (b?["height"] ?? 0) >= 220
+           }) {
+            return hintTitled
+        }
+        if let titled = substantial.first(where: { win in
+            let title = (win["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let b = win["bounds"] as? [String: CGFloat]
+            return !title.isEmpty && (b?["width"] ?? 0) >= 280 && (b?["height"] ?? 0) >= 200
+        }) {
+            return titled
+        }
+        return substantial.max(by: { lhs, rhs in
+            let lb = lhs["bounds"] as? [String: CGFloat]
+            let rb = rhs["bounds"] as? [String: CGFloat]
+            let la = (lb?["width"] ?? 0) * (lb?["height"] ?? 0)
+            let ra = (rb?["width"] ?? 0) * (rb?["height"] ?? 0)
+            return la < ra
+        })
+    }
+    return nil
+}
+
 func firstWindowID(matchingPID pid: pid_t) -> CGWindowID? {
     let wins = getWindowsList(allLayers: false)
     if let widStr = try? String(contentsOfFile: "/tmp/mcu_active_pip_wid.txt", encoding: .utf8),
@@ -141,13 +185,13 @@ func firstWindowID(matchingPID pid: pid_t) -> CGWindowID? {
         let wPid = (win["pid"] as? Int).map(pid_t.init) ?? (win["pid"] as? pid_t)
         return wPid == pid && wPid != daemonPID
     }
-    if let sizeable = owned.first(where: { win in
-        let b = win["bounds"] as? [String: CGFloat]
-        return (b?["width"] ?? 0) >= 200 && (b?["height"] ?? 0) >= 150
-    }), let id = sizeable["id"] as? Int {
+    if let best = pickSubstantiveWindow(from: owned), let id = best["id"] as? Int {
         return CGWindowID(id)
     }
-    if let first = owned.first, let id = first["id"] as? Int {
+    if let nonStrip = owned.first(where: { win in
+        guard !isMenuBarStrip(win), let b = win["bounds"] as? [String: CGFloat] else { return false }
+        return (b["width"] ?? 0) >= 120 && (b["height"] ?? 0) >= 100
+    }), let id = nonStrip["id"] as? Int {
         return CGWindowID(id)
     }
     return nil
@@ -159,6 +203,7 @@ func windowID(at point: CGPoint) -> CGWindowID? {
     for win in getWindowsList(allLayers: false) {
         let wPid = (win["pid"] as? Int).map(pid_t.init) ?? (win["pid"] as? pid_t)
         if wPid == myPID || wPid == daemonPID { continue }
+        if isMenuBarStrip(win) { continue }
         guard let b = win["bounds"] as? [String: CGFloat],
               let id = win["id"] as? Int else { continue }
         let w = b["width"] ?? 0
@@ -174,18 +219,6 @@ func windowID(at point: CGPoint) -> CGWindowID? {
 
 /// Resolves an explicit target (`--app`, `--window`, `--pid`) without falling back silently to another app/window.
 func resolveExplicitTarget(appName: String? = nil, windowID: CGWindowID? = nil, pid: pid_t? = nil, requireWindow: Bool = false) -> (pid: pid_t?, windowID: CGWindowID?, error: String?) {
-    if let p = pid {
-        let alive = NSRunningApplication(processIdentifier: p) != nil || kill(p, 0) == 0
-        guard alive else {
-            return (nil, nil, "Error: No running process found with PID \(p)")
-        }
-        let wid = windowID ?? firstWindowID(matchingPID: p)
-        if requireWindow && wid == nil {
-            return (p, nil, "Error: No visible window found for PID \(p)")
-        }
-        return (p, wid, nil)
-    }
-
     if let wid = windowID {
         let wins = getWindowsList(allLayers: true)
         guard let win = wins.first(where: { ($0["id"] as? Int) == Int(wid) }) else {
@@ -195,15 +228,29 @@ func resolveExplicitTarget(appName: String? = nil, windowID: CGWindowID? = nil, 
         return (wPid, wid, nil)
     }
 
+    if let p = pid {
+        let alive = NSRunningApplication(processIdentifier: p) != nil || kill(p, 0) == 0
+        guard alive else {
+            return (nil, nil, "Error: No running process found with PID \(p)")
+        }
+        let wid = firstWindowID(matchingPID: p)
+        if requireWindow && wid == nil {
+            return (p, nil, "Error: No visible window found for PID \(p)")
+        }
+        return (p, wid, nil)
+    }
+
     if let app = appName {
         let wid = PiPWindowController.firstWindowID(matchingApp: app)
-        let matchedApp = findRunningApplication(matching: app)
-        var resolvedPID = matchedApp?.processIdentifier
-        if resolvedPID == nil, let w = wid {
+        var resolvedPID: pid_t? = nil
+        if let w = wid {
             let wins = getWindowsList(allLayers: false)
             if let win = wins.first(where: { ($0["id"] as? Int) == Int(w) }) {
                 resolvedPID = (win["pid"] as? Int).map(pid_t.init) ?? (win["pid"] as? pid_t)
             }
+        }
+        if resolvedPID == nil {
+            resolvedPID = findRunningApplication(matching: app)?.processIdentifier
         }
         if wid == nil && resolvedPID == nil {
             return (nil, nil, "Error: Could not locate running application '\(app)'")
@@ -263,6 +310,7 @@ func clearActivePiPStateFiles(matchingWindowID windowID: Int? = nil) {
 
 /// Ensures PiP live preview is shown for a mouse operation and stays open across consecutive
 /// mouse actions until idle for `autoPiPTimeoutSeconds()` inside `cursor-daemon`.
+/// Never falls back to an unrelated window when an explicit target was given.
 @discardableResult
 func withAutoPiP<T>(
     windowID wid: CGWindowID? = nil,
@@ -277,22 +325,44 @@ func withAutoPiP<T>(
     autoPiPDepth += 1
     defer { autoPiPDepth -= 1 }
 
-    var resolvedWID = wid
-    if resolvedWID == nil, let app = appName {
-        resolvedWID = PiPWindowController.firstWindowID(matchingApp: app)
-    }
-    if resolvedWID == nil, let p = pid {
-        resolvedWID = firstWindowID(matchingPID: p)
-    }
-    if resolvedWID == nil, let pt = point {
-        resolvedWID = windowID(at: pt)
-    }
-    if resolvedWID == nil, pid == nil, appName == nil {
-        if let lastPID = resolveLastTargetPID(explicitPID: nil) {
-            resolvedWID = firstWindowID(matchingPID: lastPID)
-        }
-        if resolvedWID == nil {
-            resolvedWID = windowID(at: getMousePosition())
+    var resolvedWID: CGWindowID? = wid
+    if resolvedWID == nil {
+        if let app = appName {
+            resolvedWID = PiPWindowController.firstWindowID(matchingApp: app)
+        } else if let p = pid {
+            if let pt = point,
+               let ptWID = windowID(at: pt),
+               let win = getWindowsList(allLayers: false).first(where: { ($0["id"] as? Int) == Int(ptWID) }),
+               ((win["pid"] as? Int).map(pid_t.init) ?? (win["pid"] as? pid_t)) == p {
+                resolvedWID = ptWID
+            } else {
+                resolvedWID = firstWindowID(matchingPID: p)
+            }
+        } else if let pt = point {
+            if let savedStr = try? String(contentsOfFile: "/tmp/mcu_active_pip_wid.txt", encoding: .utf8),
+               let savedWID = Int(savedStr.trimmingCharacters(in: .whitespacesAndNewlines)),
+               let win = getWindowsList(allLayers: false).first(where: { ($0["id"] as? Int) == savedWID }),
+               let b = win["bounds"] as? [String: CGFloat] {
+                let rect = CGRect(x: b["x"] ?? 0, y: b["y"] ?? 0, width: b["width"] ?? 0, height: b["height"] ?? 0)
+                if rect.contains(pt) {
+                    resolvedWID = CGWindowID(savedWID)
+                }
+            }
+            if resolvedWID == nil {
+                resolvedWID = windowID(at: pt)
+            }
+        } else {
+            if let savedStr = try? String(contentsOfFile: "/tmp/mcu_active_pip_wid.txt", encoding: .utf8),
+               let savedWID = Int(savedStr.trimmingCharacters(in: .whitespacesAndNewlines)),
+               getWindowsList(allLayers: false).contains(where: { ($0["id"] as? Int) == savedWID }) {
+                resolvedWID = CGWindowID(savedWID)
+            }
+            if resolvedWID == nil, let lastPID = resolveLastTargetPID(explicitPID: nil) {
+                resolvedWID = firstWindowID(matchingPID: lastPID)
+            }
+            if resolvedWID == nil {
+                resolvedWID = windowID(at: getMousePosition())
+            }
         }
     }
 
@@ -1652,23 +1722,41 @@ final class PiPPanel: NSPanel {
 }
 
 /// ScreenCaptureKit stream of one window, delivering BGRA frames on the main queue.
+/// Fires `onFailure` immediately on start/stream errors OR if no complete frame arrives within `1.2s`.
 final class PiPStream: NSObject, SCStreamOutput, SCStreamDelegate {
     private let windowID: CGWindowID
     private var stream: SCStream?
     private let queue = DispatchQueue(label: "mcu.pip.stream", qos: .userInteractive)
     private var stopped = false
+    private var receivedFrame = false
+    private var frameWatchdog: DispatchWorkItem?
     var onFrame: ((CVPixelBuffer) -> Void)?
     var onFailure: (() -> Void)?
 
     init(windowID: CGWindowID) { self.windowID = windowID }
 
+    private func triggerFailure(_ reason: String) {
+        FileHandle.standardError.write("\(reason)\n".data(using: .utf8) ?? Data())
+        stop()
+        DispatchQueue.main.async { [weak self] in
+            self?.onFailure?()
+        }
+    }
+
     func start() {
+        let watchdog = DispatchWorkItem { [weak self] in
+            guard let self, !self.stopped, !self.receivedFrame else { return }
+            self.triggerFailure("PiP stream for window \(self.windowID) produced no frames within 1.2s; switching to screenshot mode")
+        }
+        frameWatchdog = watchdog
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: watchdog)
+
         Task { [weak self] in
             guard let self else { return }
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
                 guard let window = content.windows.first(where: { $0.windowID == self.windowID }) else {
-                    throw NSError(domain: "mcu.pip", code: 1)
+                    throw NSError(domain: "mcu.pip", code: 1, userInfo: [NSLocalizedDescriptionKey: "Window \(self.windowID) not shareable in ScreenCaptureKit"])
                 }
                 let filter = SCContentFilter(desktopIndependentWindow: window)
                 let config = SCStreamConfiguration()
@@ -1693,14 +1781,16 @@ final class PiPStream: NSObject, SCStreamOutput, SCStreamDelegate {
                 if self.stopped { try? await stream.stopCapture(); return }
                 self.stream = stream
             } catch {
-                FileHandle.standardError.write("PiP stream for window \(self.windowID) failed: \(error)\n".data(using: .utf8)!)
-                DispatchQueue.main.async { self.onFailure?() }
+                guard !self.stopped else { return }
+                self.triggerFailure("PiP stream for window \(self.windowID) failed: \(error)")
             }
         }
     }
 
     func stop() {
         stopped = true
+        frameWatchdog?.cancel()
+        frameWatchdog = nil
         let stream = self.stream
         self.stream = nil
         Task { try? await stream?.stopCapture() }
@@ -1712,15 +1802,17 @@ final class PiPStream: NSObject, SCStreamOutput, SCStreamDelegate {
               let statusRaw = attachments.first?[.status] as? Int,
               SCFrameStatus(rawValue: statusRaw) == .complete,
               let frame = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        if !receivedFrame {
+            receivedFrame = true
+            frameWatchdog?.cancel()
+            frameWatchdog = nil
+        }
         DispatchQueue.main.async { [weak self] in self?.onFrame?(frame) }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        FileHandle.standardError.write("PiP stream for window \(windowID) stopped: \(error)\n".data(using: .utf8)!)
-        DispatchQueue.main.async { [weak self] in
-            guard let self, !self.stopped else { return }
-            self.onFailure?()
-        }
+        guard !stopped else { return }
+        triggerFailure("PiP stream for window \(windowID) stopped: \(error)")
     }
 }
 
@@ -1808,19 +1900,27 @@ final class PiPManager {
     private var lastAutoPiPTimeout: TimeInterval = autoPiPTimeoutSeconds()
 
     func show(appName: String?, windowID: CGWindowID?, anchorPID: pid_t?) {
-        let target = windowID ?? appName.flatMap(PiPWindowController.firstWindowID(matchingApp:))
-        if let target {
-            // Manual `pip show` promotes the card out of auto-hide management.
-            autoManagedTargets.remove(target)
+        guard let target = windowID ?? appName.flatMap(PiPWindowController.firstWindowID(matchingApp:)) else {
+            let msg = "Error: Cannot open PiP preview — no valid target window found"
+            try? msg.write(toFile: kPiPLastErrorPath, atomically: true, encoding: .utf8)
+            clearActivePiPStateFiles()
+            return
         }
-        if let target, pips.contains(where: { $0.targetWindowID == target }) {
+        // Manual `pip show` promotes the card out of auto-hide management.
+        autoManagedTargets.remove(target)
+        if pips.contains(where: { $0.targetWindowID == target }) {
             restackAll()
             return
         }
         let pip = PiPWindowController(manager: self)
         pips.append(pip)
         zOrder.append(ObjectIdentifier(pip))
-        pip.show(targetWindowID: target, anchorPID: anchorPID)
+        guard pip.show(targetWindowID: target, anchorPID: anchorPID) else {
+            pips.removeAll { $0 === pip }
+            zOrder.removeAll { $0 == ObjectIdentifier(pip) }
+            clearActivePiPStateFiles(matchingWindowID: Int(target))
+            return
+        }
         relayout(animated: true, except: pip)
         restackAll()
         startFollowing()
@@ -1834,6 +1934,8 @@ final class PiPManager {
         isAutoPiPInFlight = true
 
         guard let target = windowID ?? appName.flatMap(PiPWindowController.firstWindowID(matchingApp:)) else {
+            isAutoPiPInFlight = false
+            clearActivePiPStateFiles()
             return
         }
 
@@ -1858,11 +1960,17 @@ final class PiPManager {
             return
         }
 
-        autoManagedTargets.insert(target)
         let pip = PiPWindowController(manager: self)
         pips.append(pip)
         zOrder.append(ObjectIdentifier(pip))
-        pip.show(targetWindowID: target, anchorPID: anchorPID)
+        guard pip.show(targetWindowID: target, anchorPID: anchorPID) else {
+            pips.removeAll { $0 === pip }
+            zOrder.removeAll { $0 == ObjectIdentifier(pip) }
+            isAutoPiPInFlight = false
+            clearActivePiPStateFiles(matchingWindowID: Int(target))
+            return
+        }
+        autoManagedTargets.insert(target)
         relayout(animated: true, except: pip)
         restackAll()
         startFollowing()
@@ -2129,6 +2237,9 @@ final class PiPWindowController: PiPInteractionDelegate {
     private(set) var dockSide: PiPDockSide? = nil
     var isDocked: Bool { dockSide != nil }
     private var preDockFrame: CGRect?
+    private var hasValidPreview = false
+    private var waitingForInitialFrame = false
+    private var consecutiveCaptureFailures = 0
 
     init(manager: PiPManager) { self.manager = manager }
 
@@ -2144,25 +2255,35 @@ final class PiPWindowController: PiPInteractionDelegate {
         pipView?.setControlsVisible(visible)
     }
 
-    func show(targetWindowID: CGWindowID?, anchorPID: pid_t?) {
-        self.targetWindowID = targetWindowID
+    @discardableResult
+    func show(targetWindowID: CGWindowID?, anchorPID: pid_t?) -> Bool {
+        guard let wid = targetWindowID else {
+            let msg = "Error: Cannot open PiP preview without a target window ID"
+            try? msg.write(toFile: kPiPLastErrorPath, atomically: true, encoding: .utf8)
+            return false
+        }
+        try? FileManager.default.removeItem(atPath: kPiPLastErrorPath)
+        self.targetWindowID = wid
         self.anchorPID = anchorPID
 
-        let initial = targetWindowID.flatMap(Self.capture(windowID:))
-        var targetWidth: CGFloat = 1100
-        var targetHeight: CGFloat = 700
-        if let wid = targetWindowID,
-           let list = CGWindowListCopyWindowInfo([.optionIncludingWindow], wid) as? [[String: Any]],
+        let initial = Self.capture(windowID: wid)
+        var resolvedBounds: CGRect? = nil
+        if let list = CGWindowListCopyWindowInfo([.optionIncludingWindow], wid) as? [[String: Any]],
            let info = list.first,
            let dict = info[kCGWindowBounds as String] as? NSDictionary,
            let bounds = CGRect(dictionaryRepresentation: dict),
-           bounds.width > 50, bounds.height > 50 {
-            targetWidth = bounds.width
-            targetHeight = bounds.height
-        } else if let initial {
-            targetWidth = CGFloat(initial.width) / 2.0
-            targetHeight = CGFloat(initial.height) / 2.0
+           bounds.width >= 50, bounds.height >= 50 {
+            resolvedBounds = bounds
         }
+        if resolvedBounds == nil && initial == nil {
+            let msg = "Error: Target window \(wid) is no longer visible or cannot be captured"
+            try? msg.write(toFile: kPiPLastErrorPath, atomically: true, encoding: .utf8)
+            clearActivePiPStateFiles(matchingWindowID: Int(wid))
+            return false
+        }
+
+        let targetWidth = resolvedBounds?.width ?? CGFloat(initial?.width ?? 1100) / 2.0
+        let targetHeight = resolvedBounds?.height ?? CGFloat(initial?.height ?? 700) / 2.0
         aspect = targetHeight / max(targetWidth, 1)
 
         // Every PiP is sized proportionally to its own target window (never forced to equal dimensions),
@@ -2199,33 +2320,57 @@ final class PiPWindowController: PiPInteractionDelegate {
         panel.contentView = view
         panel.setFrame(frame, display: true)
 
+        hasValidPreview = (initial != nil)
+        waitingForInitialFrame = (initial == nil)
+        consecutiveCaptureFailures = 0
+
         isShowing = true
         panel.alphaValue = 0
         if anchorPID != nil { panel.orderBack(nil) } else { panel.orderFrontRegardless() }
+        if !waitingForInitialFrame {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.25
+                panel.animator().alphaValue = 1
+            }
+        }
+
+        startCapture()
+        return true
+    }
+
+    private func revealPanelIfDeferred() {
+        guard isShowing, waitingForInitialFrame, let panel else { return }
+        waitingForInitialFrame = false
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.25
             panel.animator().alphaValue = 1
         }
-
-        startCapture()
     }
 
     /// Live capture through ScreenCaptureKit: real-time frames, and macOS marks the captured window/app with
-    /// its screen-recording indicator, the same way Codex's computer use does. Falls back to periodic
-    /// `screencapture` stills if the stream can't start.
+    /// its screen-recording indicator, the same way Codex's computer use does. Falls back cleanly to per-window
+    /// `screencapture` stills if the stream fails or produces no frames; aborts PiP if both fail.
     private func startCapture() {
         guard let wid = targetWindowID else { return }
         let stream = PiPStream(windowID: wid)
         stream.onFrame = { [weak self] frame in
             guard let self, self.isShowing else { return }
+            self.hasValidPreview = true
+            self.consecutiveCaptureFailures = 0
+            self.revealPanelIfDeferred()
             self.pipView?.updatePreview(with: frame)
         }
         stream.onFailure = { [weak self] in
             guard let self, self.isShowing, self.captureTimer == nil else { return }
             self.liveStream = nil
-            self.captureTimer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { [weak self] _ in
+            FileHandle.standardError.write("PiP switching to screenshot method for window \(wid)\n".data(using: .utf8) ?? Data())
+            self.captureTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
                 self?.updateCapture()
             }
+            if let t = self.captureTimer {
+                RunLoop.main.add(t, forMode: .common)
+            }
+            self.updateCapture()
         }
         liveStream = stream
         stream.start()
@@ -2601,12 +2746,27 @@ final class PiPWindowController: PiPInteractionDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.captureInFlight = false
-                if let image, self.isShowing { self.pipView?.updatePreview(with: image) }
+                guard self.isShowing else { return }
+                if let image {
+                    self.hasValidPreview = true
+                    self.consecutiveCaptureFailures = 0
+                    self.revealPanelIfDeferred()
+                    self.pipView?.updatePreview(with: image)
+                } else {
+                    self.consecutiveCaptureFailures += 1
+                    if (!self.hasValidPreview && self.consecutiveCaptureFailures >= 1) || self.consecutiveCaptureFailures >= 3 {
+                        let msg = "Error: PiP failed for window \(wid) — both ScreenCaptureKit stream and window screenshot failed."
+                        FileHandle.standardError.write((msg + "\n").data(using: .utf8) ?? Data())
+                        try? msg.write(toFile: kPiPLastErrorPath, atomically: true, encoding: .utf8)
+                        clearActivePiPStateFiles(matchingWindowID: Int(wid))
+                        self.hide()
+                    }
+                }
             }
         }
     }
 
-    private static func capture(windowID: CGWindowID) -> CGImage? {
+    static func capture(windowID: CGWindowID) -> CGImage? {
         let path = NSTemporaryDirectory() + "mcu_pip_capture_\(windowID).png"
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
@@ -2614,6 +2774,7 @@ final class PiPWindowController: PiPInteractionDelegate {
         guard (try? task.run()) != nil else { return nil }
         task.waitUntilExit()
         defer { try? FileManager.default.removeItem(atPath: path) }
+        guard task.terminationStatus == 0 else { return nil }
         return loadMaterializedCGImage(fromFile: path)
     }
 
@@ -2622,31 +2783,35 @@ final class PiPWindowController: PiPInteractionDelegate {
         guard !query.isEmpty else { return nil }
         let wins = getWindowsList(allLayers: false)
 
-        func pickBest(from subset: [[String: Any]]) -> CGWindowID? {
-            if let sizeable = subset.first(where: {
-                let b = $0["bounds"] as? [String: CGFloat]
-                return (b?["width"] ?? 0) >= 200 && (b?["height"] ?? 0) >= 150
-            }), let id = sizeable["id"] as? Int {
-                return CGWindowID(id)
-            }
-            if let first = subset.first, let id = first["id"] as? Int {
-                return CGWindowID(id)
-            }
-            return nil
+        let exact = wins.filter { ($0["app"] as? String ?? "").caseInsensitiveCompare(query) == .orderedSame }
+        if let best = pickSubstantiveWindow(from: exact, matchingHint: query), let id = best["id"] as? Int {
+            return CGWindowID(id)
         }
 
-        let exact = wins.filter { ($0["app"] as? String ?? "").caseInsensitiveCompare(query) == .orderedSame }
-        if let id = pickBest(from: exact) { return id }
-
         let partial = wins.filter { ($0["app"] as? String ?? "").localizedCaseInsensitiveContains(query) }
-        if let id = pickBest(from: partial) { return id }
+        if let best = pickSubstantiveWindow(from: partial, matchingHint: query), let id = best["id"] as? Int {
+            return CGWindowID(id)
+        }
 
+        var pidWins: [[String: Any]] = []
         if let matchedApp = findRunningApplication(matching: query) {
-            let pidWins = wins.filter {
+            pidWins = wins.filter {
                 let wPid = ($0["pid"] as? Int).map(pid_t.init) ?? ($0["pid"] as? pid_t)
                 return wPid == matchedApp.processIdentifier
             }
-            if let id = pickBest(from: pidWins) { return id }
+            if let best = pickSubstantiveWindow(from: pidWins, matchingHint: query), let id = best["id"] as? Int {
+                return CGWindowID(id)
+            }
+        }
+
+        // Fall back to titled/non-menubar windows >= 120x100 only if no >=200x150 substantive window matched anywhere.
+        for pool in [exact, partial, pidWins] {
+            if let candidate = pool.first(where: { win in
+                guard !isMenuBarStrip(win), let b = win["bounds"] as? [String: CGFloat] else { return false }
+                return (b["width"] ?? 0) >= 120 && (b["height"] ?? 0) >= 100
+            }), let id = candidate["id"] as? Int {
+                return CGWindowID(id)
+            }
         }
         return nil
     }
@@ -3281,10 +3446,17 @@ func getWindowsList(allLayers: Bool) -> [[String: Any]] {
         let name = info[kCGWindowName as String] as? String ?? ""
         let boundsDict = info[kCGWindowBounds as String] as? [String: CGFloat] ?? [:]
         let isMinimized = info[kCGWindowIsOnscreen as String] as? Bool == false
+        let alpha = info[kCGWindowAlpha as String] as? Double ?? 1.0
+        let x = boundsDict["X"] ?? 0
+        let y = boundsDict["Y"] ?? 0
         
         let w = boundsDict["Width"] ?? 0
         let h = boundsDict["Height"] ?? 0
         if w < 20 || h < 20 { continue }
+        if !allLayers {
+            if alpha <= 0.01 { continue }
+            if x <= -5000 || y <= -5000 { continue }
+        }
         
         windows.append([
             "id": wid,
@@ -3293,8 +3465,8 @@ func getWindowsList(allLayers: Bool) -> [[String: Any]] {
             "title": name,
             "layer": layer,
             "bounds": [
-                "x": boundsDict["X"] ?? 0,
-                "y": boundsDict["Y"] ?? 0,
+                "x": x,
+                "y": y,
                 "width": w,
                 "height": h
             ],
@@ -3599,28 +3771,55 @@ func selectRangeAction(from: CGPoint, to: CGPoint, targetPID: pid_t? = nil, wind
 func resolveTargetPID(at pt: CGPoint, explicitPID: pid_t?) -> pid_t? {
     if let pid = explicitPID { return pid }
     let myPID = ProcessInfo.processInfo.processIdentifier
+    let daemonPID = cursorDaemonPID()
     let wins = getWindowsList(allLayers: false)
-    // Prefer an active PiP target or last targeted background window containing pt
-    for path in ["/tmp/mcu_active_pip_pid.txt", "/tmp/mcu_last_target_pid.txt"] {
-        if let savedPIDStr = try? String(contentsOfFile: path, encoding: .utf8),
-           let savedPID = Int32(savedPIDStr.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            for win in wins {
-                guard let wPid = (win["pid"] as? Int).map(pid_t.init) ?? (win["pid"] as? pid_t),
-                      wPid == savedPID,
-                      let b = win["bounds"] as? [String: CGFloat] else { continue }
-                let rect = CGRect(x: b["x"] ?? 0, y: b["y"] ?? 0, width: b["width"] ?? 0, height: b["height"] ?? 0)
-                if rect.contains(pt) { return savedPID }
-            }
+    // Only an actively open PiP session overrides front-to-back z-order for overshadowed windows under pt.
+    // Stale mcu_last_target_pid.txt is reserved for keyboard follow-up and must never hijack clicks onto an unrelated app.
+    if let savedPIDStr = try? String(contentsOfFile: "/tmp/mcu_active_pip_pid.txt", encoding: .utf8),
+       let savedPID = Int32(savedPIDStr.trimmingCharacters(in: .whitespacesAndNewlines)),
+       savedPID != daemonPID {
+        for win in wins {
+            guard let wPid = (win["pid"] as? Int).map(pid_t.init) ?? (win["pid"] as? pid_t),
+                  wPid == savedPID,
+                  !isMenuBarStrip(win),
+                  let b = win["bounds"] as? [String: CGFloat] else { continue }
+            let rect = CGRect(x: b["x"] ?? 0, y: b["y"] ?? 0, width: b["width"] ?? 0, height: b["height"] ?? 0)
+            if rect.contains(pt) { return savedPID }
         }
     }
     for win in wins {
         guard let wPid = (win["pid"] as? Int).map(pid_t.init) ?? (win["pid"] as? pid_t),
-              wPid != myPID,
+              wPid != myPID && wPid != daemonPID,
+              !isMenuBarStrip(win),
               let b = win["bounds"] as? [String: CGFloat] else { continue }
         let rect = CGRect(x: b["x"] ?? 0, y: b["y"] ?? 0, width: b["width"] ?? 0, height: b["height"] ?? 0)
         if rect.contains(pt) { return wPid }
     }
     return nil
+}
+
+func resolveActionTarget(
+    appName: String?,
+    windowID: CGWindowID?,
+    targetPID: pid_t?,
+    point: CGPoint?,
+    fallbackToLastTarget: Bool = false
+) -> (pid: pid_t?, windowID: CGWindowID?, error: String?) {
+    if targetPID == nil && (appName != nil || windowID != nil) {
+        let explicit = resolveExplicitTarget(appName: appName, windowID: windowID, pid: nil)
+        if let err = explicit.error { return (nil, nil, err) }
+        return (explicit.pid, explicit.windowID, nil)
+    }
+    if let pid = targetPID {
+        return (pid, windowID, nil)
+    }
+    if let pt = point {
+        return (resolveTargetPID(at: pt, explicitPID: nil), windowID, nil)
+    }
+    if fallbackToLastTarget {
+        return (resolveLastTargetPID(explicitPID: nil), windowID, nil)
+    }
+    return (nil, windowID, nil)
 }
 
 @discardableResult
@@ -3634,7 +3833,13 @@ func clickMouseNonDisruptive(
     appName: String? = nil
 ) -> (success: Bool, message: String) {
     let pt = targetPoint ?? getMousePosition()
-    let resolvedPID = resolveTargetPID(at: pt, explicitPID: targetPID)
+    let target = resolveActionTarget(appName: appName, windowID: windowID, targetPID: targetPID, point: pt)
+    if let err = target.error {
+        fputs("\(err)\n", stderr)
+        return (false, err)
+    }
+    let resolvedWID = target.windowID
+    let resolvedPID = target.pid
 
     // Access Control check before launching PiP
     let validation = AccessControlEngine.validate(action: "mouse_click", point: pt)
@@ -3645,7 +3850,7 @@ func clickMouseNonDisruptive(
         return (false, validation.reason)
     }
 
-    withAutoPiP(windowID: windowID, appName: appName, pid: resolvedPID, point: pt) {
+    withAutoPiP(windowID: resolvedWID, appName: appName, pid: resolvedPID, point: pt) {
         // Glide our virtual cursor smoothly to the target point so movement is clearly visible!
         if let target = targetPoint {
             VirtualCursorClient.move(to: target, speed: "normal")
@@ -3749,13 +3954,18 @@ func clickMouseNonDisruptive(
 
 @discardableResult
 func moveMouseVirtual(to target: CGPoint, speed: String? = nil, duration: Double? = nil, windowID: CGWindowID? = nil, appName: String? = nil, targetPID: pid_t? = nil) -> (success: Bool, message: String) {
+    let actionTarget = resolveActionTarget(appName: appName, windowID: windowID, targetPID: targetPID, point: target)
+    if let err = actionTarget.error {
+        fputs("\(err)\n", stderr)
+        return (false, err)
+    }
     let validation = AccessControlEngine.validate(action: "cursor_move", point: target)
     if !validation.allowed {
         VirtualCursorClient.glow(color: "red")
         fputs("\(validation.reason)\n", stderr)
         return (false, validation.reason)
     }
-    withAutoPiP(windowID: windowID, appName: appName, pid: targetPID, point: target) {
+    withAutoPiP(windowID: actionTarget.windowID, appName: appName, pid: actionTarget.pid, point: target) {
         // Only moves the fancy overlay cursor - NEVER displaces the user's actual mouse!
         VirtualCursorClient.move(to: target, speed: speed, duration: duration)
         usleep(450000)
@@ -3777,9 +3987,15 @@ func dragMouse(from start: CGPoint, to end: CGPoint, duration: Double = 0.4, res
         return (false, reason)
     }
 
-    let resolvedPID = resolveTargetPID(at: start, explicitPID: targetPID)
+    let actionTarget = resolveActionTarget(appName: appName, windowID: windowID, targetPID: targetPID, point: start)
+    if let err = actionTarget.error {
+        fputs("\(err)\n", stderr)
+        return (false, err)
+    }
+    let resolvedWID = actionTarget.windowID
+    let resolvedPID = actionTarget.pid
 
-    withAutoPiP(windowID: windowID, appName: appName, pid: resolvedPID, point: start) {
+    withAutoPiP(windowID: resolvedWID, appName: appName, pid: resolvedPID, point: start) {
         VirtualCursorClient.move(to: start)
         usleep(180000)
 
@@ -3919,14 +4135,15 @@ func scrollWheel(dx: Int32, dy: Int32, at: CGPoint? = nil, targetPID: pid_t? = n
         fputs("\(validation.reason)\n", stderr)
         return (false, validation.reason)
     }
-    let resolvedPID: pid_t?
-    if let loc = at {
-        resolvedPID = resolveTargetPID(at: loc, explicitPID: targetPID)
-    } else {
-        resolvedPID = resolveLastTargetPID(explicitPID: targetPID)
+    let actionTarget = resolveActionTarget(appName: appName, windowID: windowID, targetPID: targetPID, point: at, fallbackToLastTarget: true)
+    if let err = actionTarget.error {
+        fputs("\(err)\n", stderr)
+        return (false, err)
     }
+    let resolvedWID = actionTarget.windowID
+    let resolvedPID = actionTarget.pid
 
-    withAutoPiP(windowID: windowID, appName: appName, pid: resolvedPID, point: at) {
+    withAutoPiP(windowID: resolvedWID, appName: appName, pid: resolvedPID, point: at) {
         if let loc = at {
             VirtualCursorClient.move(to: loc, speed: "fast")
             usleep(60000)
@@ -4665,8 +4882,19 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> (text: String, isEr
                 return (err, true)
             }
             resolvedWID = resolved.windowID
+        } else {
+            resolvedWID = windowID(at: getMousePosition())
+            if resolvedWID == nil {
+                return ("Error: No target window specified or found under cursor.", true)
+            }
         }
+        try? FileManager.default.removeItem(atPath: kPiPLastErrorPath)
         VirtualCursorClient.pipShow(appName: app, windowID: resolvedWID.map(Int.init))
+        usleep(220_000)
+        if let pipErr = try? String(contentsOfFile: kPiPLastErrorPath, encoding: .utf8),
+           !pipErr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return (pipErr.trimmingCharacters(in: .whitespacesAndNewlines), true)
+        }
         return ("PiP live preview activated for '\(app ?? (resolvedWID != nil ? "Window \(resolvedWID!)" : "Active Window"))'", false)
 
     case "pip_hide":
@@ -5303,8 +5531,21 @@ case "pip":
                 exit(1)
             }
             resolvedWID = resolved.windowID.map(Int.init)
+        } else {
+            resolvedWID = windowID(at: getMousePosition()).map(Int.init)
+            if resolvedWID == nil {
+                fputs("Error: No target window specified or found under cursor.\n", stderr)
+                exit(1)
+            }
         }
+        try? FileManager.default.removeItem(atPath: kPiPLastErrorPath)
         VirtualCursorClient.pipShow(appName: app, windowID: resolvedWID, anchorPID: anchorPID)
+        usleep(220_000)
+        if let pipErr = try? String(contentsOfFile: kPiPLastErrorPath, encoding: .utf8),
+           !pipErr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            fputs(pipErr.trimmingCharacters(in: .whitespacesAndNewlines) + "\n", stderr)
+            exit(1)
+        }
         print("PiP live preview activated for '\(app ?? (resolvedWID != nil ? "Window \(resolvedWID!)" : "Active Window"))'")
     case "hide", "stop", "close":
         var wid: Int? = nil
