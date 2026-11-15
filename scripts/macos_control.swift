@@ -217,7 +217,52 @@ func resolveExplicitTarget(appName: String? = nil, windowID: CGWindowID? = nil, 
     return (nil, nil, nil)
 }
 
-/// Ensures PiP live preview is shown before a mouse operation and exited automatically once it completes inside mcu.
+func autoPiPTimeoutSeconds() -> Double {
+    if let envStr = ProcessInfo.processInfo.environment["MCU_AUTO_PIP_TIMEOUT"],
+       let val = Double(envStr), val > 0 {
+        return val
+    }
+    if let nonDisruptive = AccessControlEngine.config["non_disruptive"] as? [String: Any],
+       let val = (nonDisruptive["auto_pip_timeout"] as? Double) ?? (nonDisruptive["auto_pip_timeout"] as? Int).map(Double.init),
+       val > 0 {
+        return val
+    }
+    return 4.0
+}
+
+func writeActivePiPStateFiles(appName: String? = nil, windowID: Int? = nil) {
+    var resolvedTargetPID: pid_t? = nil
+    if let w = windowID {
+        try? "\(w)".write(toFile: "/tmp/mcu_active_pip_wid.txt", atomically: true, encoding: .utf8)
+        let wins = getWindowsList(allLayers: true)
+        if let win = wins.first(where: { ($0["id"] as? Int) == w }),
+           let p = (win["pid"] as? Int) ?? (win["pid"] as? Int32).map(Int.init) {
+            resolvedTargetPID = pid_t(p)
+        }
+    } else if let a = appName, let match = findRunningApplication(matching: a) {
+        resolvedTargetPID = match.processIdentifier
+    }
+    if let tp = resolvedTargetPID {
+        try? "\(tp)".write(toFile: "/tmp/mcu_active_pip_pid.txt", atomically: true, encoding: .utf8)
+        try? "\(tp)".write(toFile: "/tmp/mcu_last_target_pid.txt", atomically: true, encoding: .utf8)
+    }
+}
+
+func clearActivePiPStateFiles(matchingWindowID windowID: Int? = nil) {
+    if let wid = windowID {
+        if let saved = try? String(contentsOfFile: "/tmp/mcu_active_pip_wid.txt", encoding: .utf8),
+           Int(saved.trimmingCharacters(in: .whitespacesAndNewlines)) == wid {
+            try? FileManager.default.removeItem(atPath: "/tmp/mcu_active_pip_pid.txt")
+            try? FileManager.default.removeItem(atPath: "/tmp/mcu_active_pip_wid.txt")
+        }
+    } else {
+        try? FileManager.default.removeItem(atPath: "/tmp/mcu_active_pip_pid.txt")
+        try? FileManager.default.removeItem(atPath: "/tmp/mcu_active_pip_wid.txt")
+    }
+}
+
+/// Ensures PiP live preview is shown for a mouse operation and stays open across consecutive
+/// mouse actions until idle for `autoPiPTimeoutSeconds()` inside `cursor-daemon`.
 @discardableResult
 func withAutoPiP<T>(
     windowID wid: CGWindowID? = nil,
@@ -255,12 +300,26 @@ func withAutoPiP<T>(
         return action()
     }
 
-    VirtualCursorClient.pipShow(appName: appName, windowID: Int(activeWID))
-    usleep(220_000)
+    let alreadyActiveSameWindow: Bool = {
+        guard cursorDaemonPID() != nil,
+              let saved = try? String(contentsOfFile: "/tmp/mcu_active_pip_wid.txt", encoding: .utf8),
+              let savedWID = Int(saved.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            return false
+        }
+        return savedWID == Int(activeWID)
+    }()
+
+    let timeout = autoPiPTimeoutSeconds()
+    VirtualCursorClient.autoPiPBegin(
+        appName: appName,
+        windowID: Int(activeWID),
+        inFlightTimeout: max(timeout * 3.0, 15.0)
+    )
+    if !alreadyActiveSameWindow {
+        usleep(180_000)
+    }
     defer {
-        usleep(250_000)
-        VirtualCursorClient.pipHide(windowID: Int(activeWID))
-        usleep(380_000)
+        VirtualCursorClient.autoPiPEnd(windowID: Int(activeWID), timeout: timeout)
     }
     return action()
 }
@@ -543,28 +602,30 @@ struct VirtualCursorClient {
         send(action: "glow", extra: ["color": color])
     }
     
-    static func pipShow(appName: String? = nil, windowID: Int? = nil, anchorPID: pid_t? = nil) {
+    private static func pipExtra(appName: String?, windowID: Int?, anchorPID: pid_t?) -> [String: Any] {
         var extra: [String: Any] = [:]
         if let a = appName { extra["app"] = a }
         if let w = windowID { extra["windowID"] = w }
         if let pid = anchorPID ?? callerAppPID() { extra["anchorPID"] = Int(pid) }
-        // Persist active PiP target PID so subsequent background actions without --window still route without stealing focus
-        var resolvedTargetPID: pid_t? = nil
-        if let w = windowID {
-            try? "\(w)".write(toFile: "/tmp/mcu_active_pip_wid.txt", atomically: true, encoding: .utf8)
-            let wins = getWindowsList(allLayers: true)
-            if let win = wins.first(where: { ($0["id"] as? Int) == w }),
-               let p = (win["pid"] as? Int) ?? (win["pid"] as? Int32).map(Int.init) {
-                resolvedTargetPID = pid_t(p)
-            }
-        } else if let a = appName, let match = findRunningApplication(matching: a) {
-            resolvedTargetPID = match.processIdentifier
-        }
-        if let tp = resolvedTargetPID {
-            try? "\(tp)".write(toFile: "/tmp/mcu_active_pip_pid.txt", atomically: true, encoding: .utf8)
-            try? "\(tp)".write(toFile: "/tmp/mcu_last_target_pid.txt", atomically: true, encoding: .utf8)
-        }
-        send(action: "pip_show", extra: extra)
+        return extra
+    }
+
+    static func pipShow(appName: String? = nil, windowID: Int? = nil, anchorPID: pid_t? = nil) {
+        writeActivePiPStateFiles(appName: appName, windowID: windowID)
+        send(action: "pip_show", extra: pipExtra(appName: appName, windowID: windowID, anchorPID: anchorPID))
+    }
+
+    static func autoPiPBegin(appName: String? = nil, windowID: Int? = nil, anchorPID: pid_t? = nil, inFlightTimeout: Double = 15.0) {
+        writeActivePiPStateFiles(appName: appName, windowID: windowID)
+        var extra = pipExtra(appName: appName, windowID: windowID, anchorPID: anchorPID)
+        extra["inFlightTimeout"] = inFlightTimeout
+        send(action: "auto_pip_begin", extra: extra)
+    }
+
+    static func autoPiPEnd(windowID: Int? = nil, timeout: Double) {
+        var extra: [String: Any] = ["timeout": timeout]
+        if let w = windowID { extra["windowID"] = w }
+        send(action: "auto_pip_end", extra: extra)
     }
 
     static func pipDock(side: String = "right") {
@@ -598,22 +659,12 @@ struct VirtualCursorClient {
     }
     
     static func pipHide(windowID: Int? = nil) {
-        if let wid = windowID {
-            if let saved = try? String(contentsOfFile: "/tmp/mcu_active_pip_wid.txt", encoding: .utf8),
-               Int(saved.trimmingCharacters(in: .whitespacesAndNewlines)) == wid {
-                try? FileManager.default.removeItem(atPath: "/tmp/mcu_active_pip_pid.txt")
-                try? FileManager.default.removeItem(atPath: "/tmp/mcu_active_pip_wid.txt")
-            }
-        } else {
-            try? FileManager.default.removeItem(atPath: "/tmp/mcu_active_pip_pid.txt")
-            try? FileManager.default.removeItem(atPath: "/tmp/mcu_active_pip_wid.txt")
-        }
+        clearActivePiPStateFiles(matchingWindowID: windowID)
         send(action: "pip_hide", extra: windowID.map { ["windowID": $0] } ?? [:])
     }
     
     static func done() {
-        try? FileManager.default.removeItem(atPath: "/tmp/mcu_active_pip_pid.txt")
-        try? FileManager.default.removeItem(atPath: "/tmp/mcu_active_pip_wid.txt")
+        clearActivePiPStateFiles()
         try? FileManager.default.removeItem(atPath: "/tmp/mcu_last_target_pid.txt")
         send(action: "done")
     }
@@ -1751,9 +1802,17 @@ final class PiPManager {
     private(set) var pips: [PiPWindowController] = []
     private var followTimer: Timer?
     private var mouseMonitors: [Any] = []
+    private var autoPiPTimer: Timer?
+    private var autoManagedTargets: Set<CGWindowID> = []
+    private var isAutoPiPInFlight: Bool = false
+    private var lastAutoPiPTimeout: TimeInterval = autoPiPTimeoutSeconds()
 
     func show(appName: String?, windowID: CGWindowID?, anchorPID: pid_t?) {
         let target = windowID ?? appName.flatMap(PiPWindowController.firstWindowID(matchingApp:))
+        if let target {
+            // Manual `pip show` promotes the card out of auto-hide management.
+            autoManagedTargets.remove(target)
+        }
         if let target, pips.contains(where: { $0.targetWindowID == target }) {
             restackAll()
             return
@@ -1767,24 +1826,135 @@ final class PiPManager {
         startFollowing()
     }
 
+    /// Reuses an existing PiP for `windowID`/`appName` across consecutive mouse actions or opens a new one,
+    /// cancelling any pending idle close timer until `endAutoPiP` arms the debounced timeout.
+    func beginAutoPiP(appName: String?, windowID: CGWindowID?, anchorPID: pid_t?, inFlightTimeout: TimeInterval = 15.0) {
+        autoPiPTimer?.invalidate()
+        autoPiPTimer = nil
+        isAutoPiPInFlight = true
+
+        guard let target = windowID ?? appName.flatMap(PiPWindowController.firstWindowID(matchingApp:)) else {
+            return
+        }
+
+        // If switching windows, close stale auto-managed cards while keeping manually shown PiPs untouched.
+        let staleAutoTargets = autoManagedTargets.filter { $0 != target }
+        for stale in staleAutoTargets {
+            autoManagedTargets.remove(stale)
+            for pip in pips where pip.targetWindowID == stale {
+                pip.hide()
+            }
+        }
+
+        if let existing = pips.first(where: { $0.targetWindowID == target }) {
+            if depth(for: existing) > 0 {
+                bringToFront(existing)
+            } else {
+                restackAll()
+            }
+            if autoManagedTargets.contains(target) {
+                scheduleAutoPiPTimer(timeout: inFlightTimeout)
+            }
+            return
+        }
+
+        autoManagedTargets.insert(target)
+        let pip = PiPWindowController(manager: self)
+        pips.append(pip)
+        zOrder.append(ObjectIdentifier(pip))
+        pip.show(targetWindowID: target, anchorPID: anchorPID)
+        relayout(animated: true, except: pip)
+        restackAll()
+        startFollowing()
+        scheduleAutoPiPTimer(timeout: inFlightTimeout)
+    }
+
+    /// Arms or resets the post-action idle timeout so consecutive mouse actions share one PiP cleanly.
+    func endAutoPiP(windowID: CGWindowID?, timeout: TimeInterval) {
+        isAutoPiPInFlight = false
+        if let wid = windowID, !autoManagedTargets.contains(wid) {
+            return
+        }
+        guard !autoManagedTargets.isEmpty else { return }
+        lastAutoPiPTimeout = max(0.2, timeout)
+        scheduleAutoPiPTimer(timeout: lastAutoPiPTimeout)
+    }
+
+    /// Extends the active post-action auto-PiP idle timeout when cursor activity continues.
+    func extendAutoPiPTimeoutIfActive(timeout: TimeInterval? = nil) {
+        guard !isAutoPiPInFlight, autoPiPTimer != nil, !autoManagedTargets.isEmpty else { return }
+        scheduleAutoPiPTimer(timeout: max(0.2, timeout ?? lastAutoPiPTimeout))
+    }
+
+    private func scheduleAutoPiPTimer(timeout: TimeInterval) {
+        autoPiPTimer?.invalidate()
+        let timer = Timer.scheduledTimer(withTimeInterval: max(0.2, timeout), repeats: false) { [weak self] _ in
+            self?.hideAutoPiPs()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        autoPiPTimer = timer
+    }
+
+    func hideAutoPiPs() {
+        autoPiPTimer?.invalidate()
+        autoPiPTimer = nil
+        isAutoPiPInFlight = false
+        let targets = autoManagedTargets
+        autoManagedTargets.removeAll()
+        for wid in targets {
+            clearActivePiPStateFiles(matchingWindowID: Int(wid))
+            for pip in pips where pip.targetWindowID == wid {
+                pip.hide()
+            }
+        }
+        if pips.isEmpty {
+            clearActivePiPStateFiles()
+            stopFollowing()
+        }
+    }
+
     func hideAll() {
+        autoPiPTimer?.invalidate()
+        autoPiPTimer = nil
+        isAutoPiPInFlight = false
+        autoManagedTargets.removeAll()
+        clearActivePiPStateFiles()
         for pip in pips { pip.hide() }
         pips.removeAll()
         stopFollowing()
     }
 
     func hide(windowID: CGWindowID) {
+        autoManagedTargets.remove(windowID)
+        clearActivePiPStateFiles(matchingWindowID: Int(windowID))
+        if autoManagedTargets.isEmpty {
+            autoPiPTimer?.invalidate()
+            autoPiPTimer = nil
+            isAutoPiPInFlight = false
+        }
         for pip in pips where pip.targetWindowID == windowID { pip.hide() }
     }
 
     func didHide(_ pip: PiPWindowController) {
+        if let wid = pip.targetWindowID {
+            autoManagedTargets.remove(wid)
+            clearActivePiPStateFiles(matchingWindowID: Int(wid))
+        }
+        if autoManagedTargets.isEmpty {
+            autoPiPTimer?.invalidate()
+            autoPiPTimer = nil
+            isAutoPiPInFlight = false
+        }
         let wasFront = depth(for: pip) == 0
         pips.removeAll { $0 === pip }
         zOrder.removeAll { $0 == ObjectIdentifier(pip) }
         _ = wasFront
         relayout(animated: true)
         restackAll()
-        if pips.isEmpty { stopFollowing() }
+        if pips.isEmpty {
+            clearActivePiPStateFiles()
+            stopFollowing()
+        }
     }
 
     /// Cards in the same deck (same caller, same corner), back to front.
@@ -2642,7 +2812,7 @@ class FancyCursorDaemon {
                   let info = notif.userInfo as? [String: Any],
                   let action = info["action"] as? String else { return }
             
-            if action != "done" && action != "pip_hide" {
+            if action != "done" && action != "pip_hide" && action != "auto_pip_end" {
                 self.resetIdleTimer()
             }
             
@@ -2657,16 +2827,28 @@ class FancyCursorDaemon {
             
             switch action {
             case "move":
+                self.pipManager?.extendAutoPiPTimeoutIfActive()
                 if let x = info["x"] as? Double, let y = info["y"] as? Double {
                     let speed = info["speed"] as? String
                     let dur = info["duration"] as? Double
                     self.moveTo(x: CGFloat(x), y: CGFloat(y), smooth: true, speed: speed, duration: dur)
                 }
             case "click":
+                self.pipManager?.extendAutoPiPTimeoutIfActive()
                 if let x = info["x"] as? Double, let y = info["y"] as? Double {
                     let btn = info["button"] as? String ?? "left"
                     self.triggerClickAction(x: CGFloat(x), y: CGFloat(y), button: btn)
                 }
+            case "auto_pip_begin":
+                let app = info["app"] as? String
+                let wid = (info["windowID"] as? Int).map { CGWindowID($0) }
+                let anchor = (info["anchorPID"] as? Int).map { pid_t($0) }
+                let inFlight = (info["inFlightTimeout"] as? Double) ?? 15.0
+                self.pipManager?.beginAutoPiP(appName: app, windowID: wid, anchorPID: anchor, inFlightTimeout: inFlight)
+            case "auto_pip_end":
+                let wid = (info["windowID"] as? Int).map { CGWindowID($0) }
+                let timeout = (info["timeout"] as? Double) ?? autoPiPTimeoutSeconds()
+                self.pipManager?.endAutoPiP(windowID: wid, timeout: timeout)
             case "pip_show":
                 let app = info["app"] as? String
                 let wid = (info["windowID"] as? Int).map { CGWindowID($0) }
@@ -4270,8 +4452,7 @@ func clickText(
     let targetWID = resolved.windowID
     let targetPID = resolved.pid
 
-    // Capture target cleanly before or inside PiP oversight
-    return withAutoPiP(windowID: targetWID, appName: appName, pid: targetPID) {
+    let runOCRAndClick: () -> (success: Bool, message: String) = {
         guard let capture = (targetWID != nil ? VisionOCREngine.captureWindowImage(windowID: targetWID!) : VisionOCREngine.captureScreenImage()) else {
             return (false, "Error: Failed to capture target image for OCR")
         }
@@ -4301,6 +4482,12 @@ func clickText(
 
         return (true, "Clicked text '\(match.matchedText)' at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) \(targetPID != nil ? "[Target PID: \(targetPID!)] (Overshadowed background delivery)" : "")")
     }
+
+    // Wrap OCR + click in Auto-PiP when target window is known upfront; otherwise let clickMouseNonDisruptive resolve the window under clickPoint.
+    if targetWID != nil {
+        return withAutoPiP(windowID: targetWID, appName: appName, pid: targetPID, action: runOCRAndClick)
+    }
+    return runOCRAndClick()
 }
 
 // MARK: - Native MCP Server (stdio JSON-RPC 2.0)
