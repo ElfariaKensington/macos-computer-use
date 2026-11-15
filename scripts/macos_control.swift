@@ -274,7 +274,7 @@ func autoPiPTimeoutSeconds() -> Double {
        val > 0 {
         return val
     }
-    return 4.0
+    return 10.0
 }
 
 func writeActivePiPStateFiles(appName: String? = nil, windowID: Int? = nil) {
@@ -295,8 +295,13 @@ func writeActivePiPStateFiles(appName: String? = nil, windowID: Int? = nil) {
     }
 }
 
+func pipReadyPath(for windowID: Int) -> String {
+    "/tmp/mcu_pip_ready_\(windowID).txt"
+}
+
 func clearActivePiPStateFiles(matchingWindowID windowID: Int? = nil) {
     if let wid = windowID {
+        try? FileManager.default.removeItem(atPath: pipReadyPath(for: wid))
         if let saved = try? String(contentsOfFile: "/tmp/mcu_active_pip_wid.txt", encoding: .utf8),
            Int(saved.trimmingCharacters(in: .whitespacesAndNewlines)) == wid {
             try? FileManager.default.removeItem(atPath: "/tmp/mcu_active_pip_pid.txt")
@@ -305,7 +310,37 @@ func clearActivePiPStateFiles(matchingWindowID windowID: Int? = nil) {
     } else {
         try? FileManager.default.removeItem(atPath: "/tmp/mcu_active_pip_pid.txt")
         try? FileManager.default.removeItem(atPath: "/tmp/mcu_active_pip_wid.txt")
+        if let files = try? FileManager.default.contentsOfDirectory(atPath: "/tmp") {
+            for f in files where f.hasPrefix("mcu_pip_ready_") && f.hasSuffix(".txt") {
+                try? FileManager.default.removeItem(atPath: "/tmp/" + f)
+            }
+        }
     }
+}
+
+func awaitPiPActivation(windowID: Int?, maxWaitSeconds: Double = 1.6) -> String? {
+    guard let wid = windowID else { return nil }
+    let deadline = Date().addingTimeInterval(maxWaitSeconds)
+    while Date() < deadline {
+        if let pipErr = try? String(contentsOfFile: kPiPLastErrorPath, encoding: .utf8) {
+            let trimmed = pipErr.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        if FileManager.default.fileExists(atPath: pipReadyPath(for: wid)) {
+            return nil
+        }
+        usleep(50_000)
+    }
+    if let pipErr = try? String(contentsOfFile: kPiPLastErrorPath, encoding: .utf8) {
+        let trimmed = pipErr.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+    }
+    if FileManager.default.fileExists(atPath: pipReadyPath(for: wid)) {
+        return nil
+    }
+    return "Error: PiP timed out without receiving a capturable frame for window \(wid)."
 }
 
 /// Ensures PiP live preview is shown for a mouse operation and stays open across consecutive
@@ -383,7 +418,7 @@ func withAutoPiP<T>(
     VirtualCursorClient.autoPiPBegin(
         appName: appName,
         windowID: Int(activeWID),
-        inFlightTimeout: max(timeout * 3.0, 15.0)
+        inFlightTimeout: max(timeout * 3.0, 30.0)
     )
     if !alreadyActiveSameWindow {
         usleep(180_000)
@@ -630,6 +665,20 @@ struct VirtualCursorClient {
             let daemonTask = Process()
             daemonTask.executableURL = URL(fileURLWithPath: binPath)
             daemonTask.arguments = ["cursor-daemon"]
+            // Detach stdio so callers using capture_output=True do not block waiting on EOF
+            daemonTask.standardInput = FileHandle.nullDevice
+            let logPath = "/tmp/mcu_cursor_daemon.log"
+            if !FileManager.default.fileExists(atPath: logPath) {
+                FileManager.default.createFile(atPath: logPath, contents: nil, attributes: nil)
+            }
+            if let logHandle = FileHandle(forWritingAtPath: logPath) {
+                logHandle.seekToEndOfFile()
+                daemonTask.standardOutput = logHandle
+                daemonTask.standardError = logHandle
+            } else {
+                daemonTask.standardOutput = FileHandle.nullDevice
+                daemonTask.standardError = FileHandle.nullDevice
+            }
             try? daemonTask.run()
             // Wait up to 1.5s for daemon PID file / notification registration
             for _ in 0..<30 {
@@ -1796,12 +1845,36 @@ final class PiPStream: NSObject, SCStreamOutput, SCStreamDelegate {
         Task { try? await stream?.stopCapture() }
     }
 
+    private static func pixelBufferHasContent(_ buffer: CVPixelBuffer) -> Bool {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return false }
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+        guard width > 0, height > 0, bytesPerRow >= width * 4 else { return false }
+        let ptr = base.assumingMemoryBound(to: UInt8.self)
+        let stepX = max(1, width / 12)
+        let stepY = max(1, height / 12)
+        for y in stride(from: stepY / 2, to: height, by: stepY) {
+            let row = y * bytesPerRow
+            for x in stride(from: stepX / 2, to: width, by: stepX) {
+                let off = row + x * 4
+                if ptr[off] > 2 || ptr[off + 1] > 2 || ptr[off + 2] > 2 {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen, sampleBuffer.isValid,
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let statusRaw = attachments.first?[.status] as? Int,
               SCFrameStatus(rawValue: statusRaw) == .complete,
               let frame = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard receivedFrame || Self.pixelBufferHasContent(frame) else { return }
         if !receivedFrame {
             receivedFrame = true
             frameWatchdog?.cancel()
@@ -1954,6 +2027,7 @@ final class PiPManager {
             } else {
                 restackAll()
             }
+            writeActivePiPStateFiles(appName: appName, windowID: Int(target))
             if autoManagedTargets.contains(target) {
                 scheduleAutoPiPTimer(timeout: inFlightTimeout)
             }
@@ -1971,6 +2045,7 @@ final class PiPManager {
             return
         }
         autoManagedTargets.insert(target)
+        writeActivePiPStateFiles(appName: appName, windowID: Int(target))
         relayout(animated: true, except: pip)
         restackAll()
         startFollowing()
@@ -2016,7 +2091,6 @@ final class PiPManager {
             }
         }
         if pips.isEmpty {
-            clearActivePiPStateFiles()
             stopFollowing()
         }
     }
@@ -2060,7 +2134,6 @@ final class PiPManager {
         relayout(animated: true)
         restackAll()
         if pips.isEmpty {
-            clearActivePiPStateFiles()
             stopFollowing()
         }
     }
@@ -2148,7 +2221,7 @@ final class PiPManager {
 
     /// For each caller: its PiPs right above the caller window, back cards first, front cards on top.
     func restackAll() {
-        let groups = Dictionary(grouping: pips.filter { $0.isShowing }) { $0.anchorPID ?? -1 }
+        let groups = Dictionary(grouping: pips.filter { $0.isShowing && !$0.isWaitingForInitialFrame }) { $0.anchorPID ?? -1 }
         let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         for (pid, group) in groups {
             let ordered = group.sorted { zIndex($0) < zIndex($1) }   // back ... front
@@ -2233,12 +2306,14 @@ final class PiPWindowController: PiPInteractionDelegate {
     private var interactionStartFrame: CGRect = .zero
     private(set) var interacting = false
     private var snapTimer: Timer?
+    private var fadeTimer: Timer?
     private(set) var isShowing = false
     private(set) var dockSide: PiPDockSide? = nil
     var isDocked: Bool { dockSide != nil }
     private var preDockFrame: CGRect?
     private var hasValidPreview = false
     private var waitingForInitialFrame = false
+    var isWaitingForInitialFrame: Bool { waitingForInitialFrame }
     private var consecutiveCaptureFailures = 0
 
     init(manager: PiPManager) { self.manager = manager }
@@ -2253,6 +2328,58 @@ final class PiPWindowController: PiPInteractionDelegate {
 
     func setControlsVisible(_ visible: Bool) {
         pipView?.setControlsVisible(visible)
+    }
+
+    private static let openFadeDuration: TimeInterval = 0.24
+    private static let closeFadeDuration: TimeInterval = 0.20
+
+    private func startPanelFade(
+        _ panel: NSPanel,
+        from startAlpha: CGFloat,
+        to targetAlpha: CGFloat,
+        duration: TimeInterval,
+        easeOut: Bool,
+        completion: (() -> Void)? = nil
+    ) {
+        fadeTimer?.invalidate()
+        fadeTimer = nil
+        panel.alphaValue = startAlpha
+
+        let steps = max(1, Int((duration / (1.0 / 60.0)).rounded()))
+        let startTime = CACurrentMediaTime()
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] t in
+            let elapsed = CACurrentMediaTime() - startTime
+            let progress = min(1.0, max(0.0, elapsed / duration))
+            let eased: Double = easeOut
+                ? (1.0 - pow(1.0 - progress, 3.0))
+                : (progress * progress)
+            panel.alphaValue = startAlpha + (targetAlpha - startAlpha) * CGFloat(eased)
+            if progress >= 1.0 || (steps > 0 && elapsed >= duration) {
+                t.invalidate()
+                if self?.fadeTimer === t {
+                    self?.fadeTimer = nil
+                }
+                panel.alphaValue = targetAlpha
+                completion?()
+            }
+        }
+        fadeTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func playOpenTransition(for panel: NSPanel) {
+        panel.alphaValue = 0
+        panel.displayIfNeeded()
+        // Wait one main runloop turn so WindowServer commits alpha=0 before stepping up cleanly.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isShowing, self.panel === panel else { return }
+            self.startPanelFade(panel, from: 0, to: 1, duration: Self.openFadeDuration, easeOut: true)
+        }
+    }
+
+    private func playCloseTransition(for panel: NSPanel, completion: @escaping () -> Void) {
+        let startAlpha = panel.alphaValue
+        startPanelFade(panel, from: startAlpha, to: 0, duration: Self.closeFadeDuration, easeOut: false, completion: completion)
     }
 
     @discardableResult
@@ -2318,20 +2445,19 @@ final class PiPWindowController: PiPInteractionDelegate {
         view.onActivateTarget = { [weak self] in self?.activateTarget() }
         pipView = view
         panel.contentView = view
-        panel.setFrame(frame, display: true)
-
         hasValidPreview = (initial != nil)
         waitingForInitialFrame = (initial == nil)
         consecutiveCaptureFailures = 0
+        panel.setFrame(frame, display: !waitingForInitialFrame)
+        if hasValidPreview {
+            try? "ready".write(toFile: pipReadyPath(for: Int(wid)), atomically: true, encoding: .utf8)
+        }
 
         isShowing = true
         panel.alphaValue = 0
-        if anchorPID != nil { panel.orderBack(nil) } else { panel.orderFrontRegardless() }
         if !waitingForInitialFrame {
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.25
-                panel.animator().alphaValue = 1
-            }
+            if anchorPID != nil { panel.orderBack(nil) } else { panel.orderFrontRegardless() }
+            playOpenTransition(for: panel)
         }
 
         startCapture()
@@ -2341,10 +2467,9 @@ final class PiPWindowController: PiPInteractionDelegate {
     private func revealPanelIfDeferred() {
         guard isShowing, waitingForInitialFrame, let panel else { return }
         waitingForInitialFrame = false
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.25
-            panel.animator().alphaValue = 1
-        }
+        if anchorPID != nil { panel.orderBack(nil) } else { panel.orderFrontRegardless() }
+        manager?.relayout(animated: true, except: self)
+        playOpenTransition(for: panel)
     }
 
     /// Live capture through ScreenCaptureKit: real-time frames, and macOS marks the captured window/app with
@@ -2357,6 +2482,7 @@ final class PiPWindowController: PiPInteractionDelegate {
             guard let self, self.isShowing else { return }
             self.hasValidPreview = true
             self.consecutiveCaptureFailures = 0
+            try? "ready".write(toFile: pipReadyPath(for: Int(wid)), atomically: true, encoding: .utf8)
             self.revealPanelIfDeferred()
             self.pipView?.updatePreview(with: frame)
         }
@@ -2384,16 +2510,31 @@ final class PiPWindowController: PiPInteractionDelegate {
         liveStream?.stop()
         liveStream = nil
         snapTimer?.invalidate()
+        fadeTimer?.invalidate()
+        fadeTimer = nil
+        let wasHidden = waitingForInitialFrame || panel.alphaValue <= 0.01
         manager?.didHide(self)
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.16
-            panel.animator().alphaValue = 0
-        }, completionHandler: {
+        if wasHidden {
             panel.orderOut(nil)
-        })
+            panel.contentView = nil
+            panel.close()
+            self.panel = nil
+            return
+        }
+        playCloseTransition(for: panel) { [weak self] in
+            panel.orderOut(nil)
+            panel.contentView = nil
+            panel.close()
+            if self?.panel === panel {
+                self?.panel = nil
+            }
+        }
     }
 
-    func orderFront() { panel?.orderFrontRegardless() }
+    func orderFront() {
+        guard !waitingForInitialFrame else { return }
+        panel?.orderFrontRegardless()
+    }
     func verifyHover() { pipView?.verifyHover() }
     /// The card as it is on screen right now (mid-animation included).
     func hoverFrame() -> CGRect { currentPreviewFrame() }
@@ -2569,11 +2710,7 @@ final class PiPWindowController: PiPInteractionDelegate {
 
     func endFadeSwap() {
         guard let panel else { return }
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.2
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            panel.animator().alphaValue = 1
-        }
+        playOpenTransition(for: panel)
     }
 
     func pipRequestFront() {
@@ -2750,6 +2887,7 @@ final class PiPWindowController: PiPInteractionDelegate {
                 if let image {
                     self.hasValidPreview = true
                     self.consecutiveCaptureFailures = 0
+                    try? "ready".write(toFile: pipReadyPath(for: Int(wid)), atomically: true, encoding: .utf8)
                     self.revealPanelIfDeferred()
                     self.pipView?.updatePreview(with: image)
                 } else {
@@ -2757,9 +2895,9 @@ final class PiPWindowController: PiPInteractionDelegate {
                     if (!self.hasValidPreview && self.consecutiveCaptureFailures >= 1) || self.consecutiveCaptureFailures >= 3 {
                         let msg = "Error: PiP failed for window \(wid) — both ScreenCaptureKit stream and window screenshot failed."
                         FileHandle.standardError.write((msg + "\n").data(using: .utf8) ?? Data())
-                        try? msg.write(toFile: kPiPLastErrorPath, atomically: true, encoding: .utf8)
-                        clearActivePiPStateFiles(matchingWindowID: Int(wid))
                         self.hide()
+                        clearActivePiPStateFiles(matchingWindowID: Int(wid))
+                        try? msg.write(toFile: kPiPLastErrorPath, atomically: true, encoding: .utf8)
                     }
                 }
             }
@@ -3723,15 +3861,14 @@ func selectRangeInBackground(pid: pid_t, from: CGPoint, to: CGPoint) -> Bool {
 
 @discardableResult
 func selectRangeAction(from: CGPoint, to: CGPoint, targetPID: pid_t? = nil, windowID: CGWindowID? = nil, appName: String? = nil, autoClean: Bool = false) -> String {
-    var pid = targetPID
-    if pid == nil, let app = appName, let match = findRunningApplication(matching: app) {
-        pid = match.processIdentifier
+    let target = resolveActionTarget(appName: appName, windowID: windowID, targetPID: targetPID, point: from)
+    if let err = target.error {
+        return err
     }
-    if pid == nil {
-        pid = resolveTargetPID(at: from, explicitPID: nil)
-    }
+    let pid = target.pid
+    let resolvedWID = target.windowID
 
-    withAutoPiP(windowID: windowID, appName: appName, pid: pid, point: from) {
+    withAutoPiP(windowID: resolvedWID, appName: appName, pid: pid, point: from) {
         // 1. Smooth glide to start point
         VirtualCursorClient.move(to: from, speed: "normal")
         usleep(250000)
@@ -3768,34 +3905,48 @@ func selectRangeAction(from: CGPoint, to: CGPoint, targetPID: pid_t? = nil, wind
     return msg
 }
 
-func resolveTargetPID(at pt: CGPoint, explicitPID: pid_t?) -> pid_t? {
-    if let pid = explicitPID { return pid }
+func resolveTargetWindowAndPID(at pt: CGPoint, explicitPID: pid_t?) -> (pid: pid_t?, windowID: CGWindowID?) {
+    if let pid = explicitPID { return (pid, nil) }
     let myPID = ProcessInfo.processInfo.processIdentifier
     let daemonPID = cursorDaemonPID()
     let wins = getWindowsList(allLayers: false)
-    // Only an actively open PiP session overrides front-to-back z-order for overshadowed windows under pt.
-    // Stale mcu_last_target_pid.txt is reserved for keyboard follow-up and must never hijack clicks onto an unrelated app.
-    if let savedPIDStr = try? String(contentsOfFile: "/tmp/mcu_active_pip_pid.txt", encoding: .utf8),
-       let savedPID = Int32(savedPIDStr.trimmingCharacters(in: .whitespacesAndNewlines)),
-       savedPID != daemonPID {
-        for win in wins {
-            guard let wPid = (win["pid"] as? Int).map(pid_t.init) ?? (win["pid"] as? pid_t),
-                  wPid == savedPID,
-                  !isMenuBarStrip(win),
-                  let b = win["bounds"] as? [String: CGFloat] else { continue }
-            let rect = CGRect(x: b["x"] ?? 0, y: b["y"] ?? 0, width: b["width"] ?? 0, height: b["height"] ?? 0)
-            if rect.contains(pt) { return savedPID }
+    // Only the exact actively open PiP window overrides front-to-back z-order when pt falls inside its bounds.
+    // Never hijack coordinates using another window of the same PID or stale mcu_last_target_pid.txt.
+    if daemonPID != nil,
+       let savedWIDStr = try? String(contentsOfFile: "/tmp/mcu_active_pip_wid.txt", encoding: .utf8),
+       let savedWID = Int(savedWIDStr.trimmingCharacters(in: .whitespacesAndNewlines)),
+       let win = wins.first(where: { ($0["id"] as? Int) == savedWID }),
+       !isMenuBarStrip(win),
+       let wPid = (win["pid"] as? Int).map(pid_t.init) ?? (win["pid"] as? pid_t),
+       wPid != daemonPID,
+       let b = win["bounds"] as? [String: CGFloat] {
+        let rect = CGRect(x: b["x"] ?? 0, y: b["y"] ?? 0, width: b["width"] ?? 0, height: b["height"] ?? 0)
+        if rect.contains(pt) {
+            return (wPid, CGWindowID(savedWID))
         }
     }
     for win in wins {
         guard let wPid = (win["pid"] as? Int).map(pid_t.init) ?? (win["pid"] as? pid_t),
               wPid != myPID && wPid != daemonPID,
               !isMenuBarStrip(win),
-              let b = win["bounds"] as? [String: CGFloat] else { continue }
-        let rect = CGRect(x: b["x"] ?? 0, y: b["y"] ?? 0, width: b["width"] ?? 0, height: b["height"] ?? 0)
-        if rect.contains(pt) { return wPid }
+              let b = win["bounds"] as? [String: CGFloat],
+              let widInt = win["id"] as? Int else { continue }
+        let w = b["width"] ?? 0
+        let h = b["height"] ?? 0
+        if w < 20 || h < 20 { continue }
+        let rect = CGRect(x: b["x"] ?? 0, y: b["y"] ?? 0, width: w, height: h)
+        if rect.contains(pt) {
+            return (wPid, CGWindowID(widInt))
+        }
     }
-    return nil
+    return (nil, nil)
+}
+
+func setTargetWindow(_ event: CGEvent?, windowID: CGWindowID?) {
+    guard let ev = event, let wid = windowID else { return }
+    let w = Int64(wid)
+    ev.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: w)
+    ev.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: w)
 }
 
 func resolveActionTarget(
@@ -3814,12 +3965,113 @@ func resolveActionTarget(
         return (pid, windowID, nil)
     }
     if let pt = point {
-        return (resolveTargetPID(at: pt, explicitPID: nil), windowID, nil)
+        let atPt = resolveTargetWindowAndPID(at: pt, explicitPID: nil)
+        return (atPt.pid, windowID ?? atPt.windowID, nil)
     }
     if fallbackToLastTarget {
         return (resolveLastTargetPID(explicitPID: nil), windowID, nil)
     }
     return (nil, windowID, nil)
+}
+
+enum HIDFallbackMode {
+    case auto
+    case force
+    case disabled
+}
+
+private func isChromiumOrCEFProcess(pid: pid_t?) -> Bool {
+    guard let pid, let app = NSRunningApplication(processIdentifier: pid) else { return false }
+    let haystacks = [
+        app.bundleIdentifier?.lowercased() ?? "",
+        app.executableURL?.lastPathComponent.lowercased() ?? "",
+        app.localizedName?.lowercased() ?? ""
+    ]
+    let tokens = [
+        "chromium", "chrome", "electron", "cef", "steam", "brave", "edgemac",
+        "msedge", "arc", "discord", "spotify", "slack", "obsidian", "vscode",
+        "code helper", "cursor", "todesktop"
+    ]
+    return haystacks.contains { s in tokens.contains { s.contains($0) } }
+}
+
+private func raiseTargetWindowForHID(pid: pid_t, windowID: CGWindowID?) {
+    if let app = NSRunningApplication(processIdentifier: pid) {
+        app.activate(options: [])
+    }
+    let appEl = AXUIElementCreateApplication(pid)
+    if let windows = getAttribute(appEl, kAXWindowsAttribute) as? [AXUIElement] {
+        for win in windows {
+            if let wid = windowID {
+                var wNum: CGWindowID = 0
+                if _AXUIElementGetWindow(win, &wNum) == .success, wNum == wid {
+                    AXUIElementPerformAction(win, kAXRaiseAction as CFString)
+                    return
+                }
+            }
+        }
+        if let first = windows.first {
+            AXUIElementPerformAction(first, kAXRaiseAction as CFString)
+        }
+    }
+}
+
+private func postHIDClickFallback(
+    at pt: CGPoint,
+    button: CGMouseButton,
+    clickCount: Int,
+    downType: CGEventType,
+    upType: CGEventType,
+    targetPID: pid_t?,
+    targetWindowID: CGWindowID?,
+    restoreCursor: Bool
+) {
+    let prevCursor = getMousePosition()
+    let prevApp = NSWorkspace.shared.frontmostApplication
+    let myPID = ProcessInfo.processInfo.processIdentifier
+    let daemonPID = cursorDaemonPID()
+
+    // Ensure the target point on targetWindowID is not occluded by another app window before posting HID events.
+    if let pid = targetPID, let wid = targetWindowID, windowID(at: pt) != wid {
+        raiseTargetWindowForHID(pid: pid, windowID: wid)
+        usleep(120_000)
+    }
+
+    let source = CGEventSource(stateID: .hidSystemState)
+    if let moveEv = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: pt, mouseButton: button) {
+        moveEv.post(tap: .cghidEventTap)
+    }
+    usleep(50_000)
+
+    let buttonName = (button == .right ? "right" : (button == .center ? "middle" : "left"))
+    for i in 1...clickCount {
+        VirtualCursorClient.click(at: pt, button: buttonName)
+        if let downEv = CGEvent(mouseEventSource: source, mouseType: downType, mouseCursorPosition: pt, mouseButton: button) {
+            downEv.setIntegerValueField(.mouseEventClickState, value: Int64(i))
+            downEv.post(tap: .cghidEventTap)
+        }
+        usleep(40_000)
+        if let upEv = CGEvent(mouseEventSource: source, mouseType: upType, mouseCursorPosition: pt, mouseButton: button) {
+            upEv.setIntegerValueField(.mouseEventClickState, value: Int64(i))
+            upEv.post(tap: .cghidEventTap)
+        }
+        if i < clickCount { usleep(120_000) }
+    }
+
+    usleep(60_000)
+    if restoreCursor {
+        if let restoreEv = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: prevCursor, mouseButton: button) {
+            restoreEv.post(tap: .cghidEventTap)
+        }
+        usleep(40_000)
+    }
+
+    if let prev = prevApp,
+       prev.processIdentifier != myPID,
+       prev.processIdentifier != daemonPID,
+       prev.processIdentifier != targetPID {
+        prev.activate(options: [])
+    }
 }
 
 @discardableResult
@@ -3830,7 +4082,8 @@ func clickMouseNonDisruptive(
     restoreCursor: Bool = true,
     targetPID: pid_t? = nil,
     windowID: CGWindowID? = nil,
-    appName: String? = nil
+    appName: String? = nil,
+    hidMode: HIDFallbackMode = .auto
 ) -> (success: Bool, message: String) {
     let pt = targetPoint ?? getMousePosition()
     let target = resolveActionTarget(appName: appName, windowID: windowID, targetPID: targetPID, point: pt)
@@ -3850,6 +4103,7 @@ func clickMouseNonDisruptive(
         return (false, validation.reason)
     }
 
+    var deliveryMode = "Zero-focus background delivery"
     withAutoPiP(windowID: resolvedWID, appName: appName, pid: resolvedPID, point: pt) {
         // Glide our virtual cursor smoothly to the target point so movement is clearly visible!
         if let target = targetPoint {
@@ -3876,12 +4130,14 @@ func clickMouseNonDisruptive(
         let containerStopRoles: Set<String> = ["AXWindow", "AXApplication", "AXWebArea", "AXScrollArea", "AXSplitGroup", "AXToolbar", "AXSheet"]
 
         var handledViaAX = false
-        if let pid = resolvedPID, button == .left {
+        var axHitRole: String? = nil
+        if let pid = resolvedPID, button == .left, hidMode != .force {
             try? "\(pt.x),\(pt.y)".write(toFile: "/tmp/mcu_last_click_\(pid).txt", atomically: true, encoding: .utf8)
             try? "\(pid)".write(toFile: "/tmp/mcu_last_target_pid.txt", atomically: true, encoding: .utf8)
             let appEl = AXUIElementCreateApplication(pid)
             var hitEl: AXUIElement?
             if AXUIElementCopyElementAtPosition(appEl, Float(pt.x), Float(pt.y), &hitEl) == .success, let leaf = hitEl {
+                axHitRole = getAttribute(leaf, kAXRoleAttribute) as? String
                 // Walk up at most 4 levels to find an explicit interactive control; NEVER fall back to AXWindow or AXWebArea!
                 var matchedControl: AXUIElement? = nil
                 var curr: AXUIElement = leaf
@@ -3901,42 +4157,73 @@ func clickMouseNonDisruptive(
                     }
                 }
 
-                VirtualCursorClient.click(at: pt, button: "left")
                 if let ctrl = matchedControl {
                     // NEVER set kAXFocusedAttribute = true on WebKit/AppKit background elements as WebKit calls makeKeyAndOrderFront!
                     // Instead, perform kAXPressAction and track the clicked input coordinate for subsequent keyboard typing.
-                    AXUIElementPerformAction(ctrl, kAXPressAction as CFString)
-                    handledViaAX = true
+                    if AXUIElementPerformAction(ctrl, kAXPressAction as CFString) == .success {
+                        VirtualCursorClient.click(at: pt, button: "left")
+                        handledViaAX = true
+                    }
                 } else {
-                    let leafRole = getAttribute(leaf, kAXRoleAttribute) as? String ?? ""
-                    if !containerStopRoles.contains(leafRole) {
-                        AXUIElementPerformAction(leaf, kAXPressAction as CFString)
+                    let leafRole = axHitRole ?? ""
+                    if !containerStopRoles.contains(leafRole),
+                       AXUIElementPerformAction(leaf, kAXPressAction as CFString) == .success {
+                        VirtualCursorClient.click(at: pt, button: "left")
                         handledViaAX = true
                     }
                 }
             }
         }
 
-        // Only post raw CGEvent to PID if AX did not handle it (or for right/middle clicks)
         if !handledViaAX {
-            for i in 1...clickCount {
-                VirtualCursorClient.click(at: pt, button: (button == .right ? "right" : "left"))
+            let shouldUseHID: Bool
+            switch hidMode {
+            case .force:
+                shouldUseHID = true
+            case .disabled:
+                shouldUseHID = false
+            case .auto:
+                shouldUseHID = (button == .left) && resolvedPID != nil && (
+                    axHitRole == nil ||
+                    axHitRole == "AXWindow" ||
+                    isChromiumOrCEFProcess(pid: resolvedPID)
+                )
+            }
 
-                let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: pt, mouseButton: button)
-                down?.setIntegerValueField(.mouseEventClickState, value: Int64(i))
-                if let pid = resolvedPID {
-                    down?.postToPid(pid)
+            if shouldUseHID {
+                postHIDClickFallback(
+                    at: pt,
+                    button: button,
+                    clickCount: clickCount,
+                    downType: downType,
+                    upType: upType,
+                    targetPID: resolvedPID,
+                    targetWindowID: resolvedWID,
+                    restoreCursor: restoreCursor
+                )
+                deliveryMode = (hidMode == .force) ? "HID click (cursor/focus restored)" : "HID fallback (CEF/no-AX target; cursor/focus restored)"
+            } else {
+                let source = CGEventSource(stateID: .hidSystemState)
+                func postTargeted(_ type: CGEventType, clickState: Int64) {
+                    let ev = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: pt, mouseButton: button)
+                    setTargetWindow(ev, windowID: resolvedWID)
+                    ev?.setIntegerValueField(.mouseEventClickState, value: clickState)
+                    if let pid = resolvedPID {
+                        ev?.postToPid(pid)
+                    }
                 }
 
-                usleep(15000)
+                // Deliver a targeted mouseMoved first so Chromium/CEF & AppKit tracking areas register hover at pt
+                postTargeted(.mouseMoved, clickState: 0)
+                usleep(60000)
 
-                let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: pt, mouseButton: button)
-                up?.setIntegerValueField(.mouseEventClickState, value: Int64(i))
-                if let pid = resolvedPID {
-                    up?.postToPid(pid)
+                for i in 1...clickCount {
+                    VirtualCursorClient.click(at: pt, button: (button == .right ? "right" : (button == .center ? "middle" : "left")))
+                    postTargeted(downType, clickState: Int64(i))
+                    usleep(40000)
+                    postTargeted(upType, clickState: Int64(i))
+                    if i < clickCount { usleep(120000) }
                 }
-
-                if i < clickCount { usleep(120000) }
             }
         }
 
@@ -3947,7 +4234,7 @@ func clickMouseNonDisruptive(
     }
 
     AccessControlEngine.logAudit(action: "mouse_click", details: "Point (\(Int(pt.x)), \(Int(pt.y))), button=\(button == .left ? "left" : "right"), count=\(clickCount), targetPID=\(String(describing: resolvedPID))")
-    let msg = "Clicked at (\(Int(pt.x)), \(Int(pt.y))) button=\(button == .left ? "left" : (button == .right ? "right" : "middle")) \(resolvedPID != nil ? "[Target PID: \(resolvedPID!)] (Zero-focus background delivery)" : "")"
+    let msg = "Clicked at (\(Int(pt.x)), \(Int(pt.y))) button=\(button == .left ? "left" : (button == .right ? "right" : "middle")) \(resolvedPID != nil ? "[Target PID: \(resolvedPID!)] (\(deliveryMode))" : "")"
     emitOutput(msg)
     return (true, msg)
 }
@@ -4001,6 +4288,7 @@ func dragMouse(from start: CGPoint, to end: CGPoint, duration: Double = 0.4, res
 
         if let pid = resolvedPID {
             let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left)
+            setTargetWindow(down, windowID: resolvedWID)
             down?.postToPid(pid)
             usleep(20000)
 
@@ -4016,11 +4304,13 @@ func dragMouse(from start: CGPoint, to end: CGPoint, duration: Double = 0.4, res
                     VirtualCursorClient.move(to: pt, speed: "instant")
                 }
                 let drag = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: pt, mouseButton: .left)
+                setTargetWindow(drag, windowID: resolvedWID)
                 drag?.postToPid(pid)
                 usleep(useconds_t(duration / Double(steps) * 1_000_000))
             }
 
             let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left)
+            setTargetWindow(up, windowID: resolvedWID)
             up?.postToPid(pid)
         } else {
             let originalUserPos = getMousePosition()
@@ -4167,6 +4457,7 @@ func scrollWheel(dx: Int32, dy: Int32, at: CGPoint? = nil, targetPID: pid_t? = n
         }
 
         let event = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0)
+        setTargetWindow(event, windowID: resolvedWID)
         if let loc = at {
             event?.location = loc
         }
@@ -4440,6 +4731,11 @@ func printUsage() {
       mcu click text <query> [options]         Semantically find & click text with virtual cursor
       mcu select range <x1> <y1> <x2> <y2>     Select range of text in background without focus
       mcu done                                 Clean up and dismiss all PiP previews and virtual cursor
+      mcu --update [options]                   Download & install latest release from GitHub
+          --check                              Check latest release without installing
+          --tag <tag>                          Install a specific release tag (e.g. v0.2.0)
+          --prerelease                         Include pre-releases when checking latest
+          --repo <owner/repo>                  Override GitHub repo (default: ElfariaKensington/macos-computer-use)
       mcu mcp                                  Run native MCP Server over stdio JSON-RPC 2.0
     """
     print(usage)
@@ -4660,7 +4956,8 @@ func clickText(
     windowID: CGWindowID? = nil,
     button: CGMouseButton = .left,
     clickCount: Int = 1,
-    autoClean: Bool = false
+    autoClean: Bool = false,
+    hidMode: HIDFallbackMode = .auto
 ) -> (success: Bool, message: String) {
     let resolved = resolveExplicitTarget(appName: appName, windowID: windowID, requireWindow: (appName != nil || windowID != nil))
     if let err = resolved.error {
@@ -4687,7 +4984,8 @@ func clickText(
             restoreCursor: true,
             targetPID: targetPID,
             windowID: targetWID,
-            appName: appName
+            appName: appName,
+            hidMode: hidMode
         )
         if !clickRes.success {
             return clickRes
@@ -4697,7 +4995,7 @@ func clickText(
             VirtualCursorClient.done()
         }
 
-        return (true, "Clicked text '\(match.matchedText)' at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) \(targetPID != nil ? "[Target PID: \(targetPID!)] (Overshadowed background delivery)" : "")")
+        return (true, "Clicked text '\(match.matchedText)' at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) \(targetPID != nil ? "[Target PID: \(targetPID!)]" : "")")
     }
 
     // Wrap OCR + click in Auto-PiP when target window is known upfront; otherwise let clickMouseNonDisruptive resolve the window under clickPoint.
@@ -4728,6 +5026,8 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> (text: String, isEr
         let count = (args["count"] as? NSNumber)?.intValue ?? 1
         let app = args["app"] as? String
         let wid = (args["window"] as? NSNumber).map { CGWindowID($0.intValue) }
+        let hidArg = (args["hid"] as? Bool)
+        let hidMode: HIDFallbackMode = (hidArg == true) ? .force : ((hidArg == false) ? .disabled : .auto)
         let resolved = resolveExplicitTarget(appName: app, windowID: wid)
         if let err = resolved.error {
             return (err, true)
@@ -4739,7 +5039,8 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> (text: String, isEr
             restoreCursor: true,
             targetPID: resolved.pid,
             windowID: resolved.windowID,
-            appName: app
+            appName: app,
+            hidMode: hidMode
         )
         if let autoClean = args["done"] as? Bool, autoClean {
             VirtualCursorClient.done()
@@ -4889,11 +5190,12 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> (text: String, isEr
             }
         }
         try? FileManager.default.removeItem(atPath: kPiPLastErrorPath)
+        if let rw = resolvedWID {
+            try? FileManager.default.removeItem(atPath: pipReadyPath(for: Int(rw)))
+        }
         VirtualCursorClient.pipShow(appName: app, windowID: resolvedWID.map(Int.init))
-        usleep(220_000)
-        if let pipErr = try? String(contentsOfFile: kPiPLastErrorPath, encoding: .utf8),
-           !pipErr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return (pipErr.trimmingCharacters(in: .whitespacesAndNewlines), true)
+        if let pipErr = awaitPiPActivation(windowID: resolvedWID.map(Int.init)) {
+            return (pipErr, true)
         }
         return ("PiP live preview activated for '\(app ?? (resolvedWID != nil ? "Window \(resolvedWID!)" : "Active Window"))'", false)
 
@@ -5296,7 +5598,398 @@ func runMCPServer() {
     }
 }
 
+func syncURLDataRequest(_ request: URLRequest) -> (data: Data?, statusCode: Int, error: String?) {
+    let sem = DispatchSemaphore(value: 0)
+    var outData: Data?
+    var outStatus = 0
+    var outErr: String?
+    let task = URLSession.shared.dataTask(with: request) { data, resp, err in
+        if let http = resp as? HTTPURLResponse { outStatus = http.statusCode }
+        if let err { outErr = err.localizedDescription }
+        outData = data
+        sem.signal()
+    }
+    task.resume()
+    sem.wait()
+    return (outData, outStatus, outErr)
+}
+
+func makeGitHubRequest(url: URL, accept: String) -> URLRequest {
+    var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
+    req.setValue(accept, forHTTPHeaderField: "Accept")
+    req.setValue("macos-computer-use-cli", forHTTPHeaderField: "User-Agent")
+    if let token = ProcessInfo.processInfo.environment["GITHUB_TOKEN"] ?? ProcessInfo.processInfo.environment["GH_TOKEN"],
+       !token.isEmpty {
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+    return req
+}
+
+func downloadFileSync(from url: URL, to destination: URL) -> String? {
+    let sem = DispatchSemaphore(value: 0)
+    var outErr: String?
+    let req = makeGitHubRequest(url: url, accept: "application/octet-stream")
+    let task = URLSession.shared.downloadTask(with: req) { tempURL, resp, err in
+        defer { sem.signal() }
+        if let err {
+            outErr = err.localizedDescription
+            return
+        }
+        if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            outErr = "HTTP \(http.statusCode) downloading \(url.lastPathComponent)"
+            return
+        }
+        guard let tempURL else {
+            outErr = "Empty download for \(url.lastPathComponent)"
+            return
+        }
+        do {
+            let fm = FileManager.default
+            if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
+            try fm.moveItem(at: tempURL, to: destination)
+        } catch {
+            outErr = error.localizedDescription
+        }
+    }
+    task.resume()
+    sem.wait()
+    return outErr
+}
+
+func computeSHA256(fileURL: URL) -> String? {
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/shasum")
+    task.arguments = ["-a", "256", fileURL.path]
+    let pipe = Pipe()
+    task.standardOutput = pipe
+    do {
+        try task.run()
+        task.waitUntilExit()
+    } catch {
+        return nil
+    }
+    guard task.terminationStatus == 0 else { return nil }
+    let raw = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    return raw.split(separator: " ").first.map { String($0).lowercased() }
+}
+
+func verifyReleaseArchiveChecksum(sumsURL: URL?, archiveName: String, archiveURL: URL) -> (verified: Bool, error: String?) {
+    guard let sumsURL,
+          let sumsText = try? String(contentsOf: sumsURL, encoding: .utf8) else {
+        return (false, nil)
+    }
+    var expectedHash: String? = nil
+    for line in sumsText.split(whereSeparator: \.isNewline) {
+        let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+        guard parts.count >= 2 else { continue }
+        let hash = String(parts[0]).lowercased()
+        let filename = URL(fileURLWithPath: String(parts.last!)).lastPathComponent
+        if filename == archiveName {
+            expectedHash = hash
+            break
+        }
+    }
+    guard let expectedHash else { return (false, nil) }
+    guard let actualHash = computeSHA256(fileURL: archiveURL) else {
+        return (false, "Failed to compute SHA-256 for \(archiveName)")
+    }
+    if actualHash != expectedHash {
+        return (false, "SHA-256 mismatch for \(archiveName): expected \(expectedHash), got \(actualHash)")
+    }
+    return (true, nil)
+}
+
+func findExtractedBinary(in rootDir: URL) -> (binary: URL, payloadRoot: URL)? {
+    let fm = FileManager.default
+    let nested = rootDir.appendingPathComponent("macos-computer-use/scripts/bin/mcu")
+    if fm.fileExists(atPath: nested.path) {
+        return (nested, rootDir.appendingPathComponent("macos-computer-use"))
+    }
+    let direct = rootDir.appendingPathComponent("scripts/bin/mcu")
+    if fm.fileExists(atPath: direct.path) {
+        return (direct, rootDir)
+    }
+    if let enumerator = fm.enumerator(at: rootDir, includingPropertiesForKeys: nil) {
+        for case let url as URL in enumerator {
+            if url.lastPathComponent == "mcu" && url.path.contains("/scripts/bin/mcu") {
+                let payload = url.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+                return (url, payload)
+            }
+        }
+    }
+    let flatBin = rootDir.appendingPathComponent("mcu")
+    if fm.fileExists(atPath: flatBin.path) {
+        return (flatBin, rootDir)
+    }
+    return nil
+}
+
+func performSelfUpdate(args: [String]) -> Never {
+    var checkOnly = false
+    var includePrerelease = false
+    var repo = ProcessInfo.processInfo.environment["MCU_UPDATE_REPO"] ?? "ElfariaKensington/macos-computer-use"
+    var tag: String? = nil
+    var apiURLOverride = ProcessInfo.processInfo.environment["MCU_UPDATE_API_URL"]
+
+    var i = 1
+    while i < args.count {
+        let arg = args[i]
+        if arg == "--check" {
+            checkOnly = true
+        } else if arg == "--prerelease" {
+            includePrerelease = true
+        } else if arg == "--repo", i + 1 < args.count {
+            repo = args[i + 1]
+            i += 1
+        } else if arg == "--tag", i + 1 < args.count {
+            tag = args[i + 1]
+            i += 1
+        } else if arg == "--api-url", i + 1 < args.count {
+            apiURLOverride = args[i + 1]
+            i += 1
+        }
+        i += 1
+    }
+
+    let endpointString: String
+    if let override = apiURLOverride, !override.isEmpty {
+        endpointString = override
+    } else if let tag {
+        endpointString = "https://api.github.com/repos/\(repo)/releases/tags/\(tag)"
+    } else if includePrerelease {
+        endpointString = "https://api.github.com/repos/\(repo)/releases"
+    } else {
+        endpointString = "https://api.github.com/repos/\(repo)/releases/latest"
+    }
+
+    guard let apiURL = URL(string: endpointString) else {
+        fputs("Error: Invalid update endpoint URL: \(endpointString)\n", stderr)
+        exit(1)
+    }
+
+    let req = makeGitHubRequest(url: apiURL, accept: "application/vnd.github+json")
+    let (data, status, netErr) = syncURLDataRequest(req)
+    if let netErr {
+        fputs("Error fetching release metadata: \(netErr)\n", stderr)
+        exit(1)
+    }
+    if status == 404 {
+        fputs("No published release found at \(endpointString). Run the GitHub Release workflow or retry with --prerelease / --tag.\n", stderr)
+        exit(1)
+    }
+    guard (200..<300).contains(status), let data else {
+        fputs("Error fetching release metadata (HTTP \(status)) from \(endpointString)\n", stderr)
+        exit(1)
+    }
+
+    guard let parsed = try? JSONSerialization.jsonObject(with: data) else {
+        fputs("Error: Invalid JSON returned from release API.\n", stderr)
+        exit(1)
+    }
+
+    let releaseDict: [String: Any]?
+    if let dict = parsed as? [String: Any] {
+        releaseDict = dict
+    } else if let list = parsed as? [[String: Any]] {
+        releaseDict = list.first(where: { (($0["draft"] as? Bool) ?? false) == false })
+    } else {
+        releaseDict = nil
+    }
+
+    guard let release = releaseDict, let tagName = release["tag_name"] as? String else {
+        fputs("Error: No release object with tag_name found.\n", stderr)
+        exit(1)
+    }
+
+    let assets = (release["assets"] as? [[String: Any]]) ?? []
+    let archiveAsset = assets.first(where: {
+        let n = ($0["name"] as? String) ?? ""
+        return n.hasPrefix("mcu-") && n.hasSuffix("-macos-universal.tar.gz")
+    }) ?? assets.first(where: {
+        (($0["name"] as? String) ?? "").hasSuffix(".tar.gz")
+    }) ?? assets.first(where: {
+        (($0["name"] as? String) ?? "") == "mcu"
+    })
+
+    guard let asset = archiveAsset,
+          let assetName = asset["name"] as? String,
+          let assetURLString = asset["browser_download_url"] as? String,
+          let assetURL = URL(string: assetURLString) else {
+        fputs("Error: Release \(tagName) contains no downloadable macOS universal asset.\n", stderr)
+        exit(1)
+    }
+
+    if checkOnly {
+        let isPre = (release["prerelease"] as? Bool) ?? false
+        let htmlURL = (release["html_url"] as? String) ?? ""
+        print("Latest release: \(tagName)\(isPre ? " (prerelease)" : "")")
+        print("Asset: \(assetName)")
+        print("Download URL: \(assetURLString)")
+        if !htmlURL.isEmpty { print("Release page: \(htmlURL)") }
+        exit(0)
+    }
+
+    let fm = FileManager.default
+    let workDir = URL(fileURLWithPath: "/tmp/mcu_update_\(ProcessInfo.processInfo.processIdentifier)")
+    try? fm.removeItem(at: workDir)
+    do {
+        try fm.createDirectory(at: workDir, withIntermediateDirectories: true)
+    } catch {
+        fputs("Error creating temp directory: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+    defer { try? fm.removeItem(at: workDir) }
+
+    print("Downloading \(assetName) (\(tagName))...")
+    let archiveLocalURL = workDir.appendingPathComponent(assetName)
+    if let err = downloadFileSync(from: assetURL, to: archiveLocalURL) {
+        fputs("Error downloading \(assetName): \(err)\n", stderr)
+        exit(1)
+    }
+
+    var sumsLocalURL: URL? = nil
+    if let sumsAsset = assets.first(where: { ($0["name"] as? String) == "SHA256SUMS.txt" }),
+       let sumsURLStr = sumsAsset["browser_download_url"] as? String,
+       let sumsRemoteURL = URL(string: sumsURLStr) {
+        let dest = workDir.appendingPathComponent("SHA256SUMS.txt")
+        if downloadFileSync(from: sumsRemoteURL, to: dest) == nil {
+            sumsLocalURL = dest
+        }
+    }
+
+    let checksumResult = verifyReleaseArchiveChecksum(sumsURL: sumsLocalURL, archiveName: assetName, archiveURL: archiveLocalURL)
+    if let csErr = checksumResult.error {
+        fputs("Error: \(csErr)\n", stderr)
+        exit(1)
+    }
+
+    let extractedBinary: URL
+    let payloadRoot: URL?
+    if assetName.hasSuffix(".tar.gz") || assetName.hasSuffix(".tgz") {
+        let extractDir = workDir.appendingPathComponent("extracted")
+        try? fm.createDirectory(at: extractDir, withIntermediateDirectories: true)
+        let tarTask = Process()
+        tarTask.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        tarTask.arguments = ["-xzf", archiveLocalURL.path, "-C", extractDir.path]
+        try? tarTask.run()
+        tarTask.waitUntilExit()
+        guard tarTask.terminationStatus == 0,
+              let located = findExtractedBinary(in: extractDir) else {
+            fputs("Error: Failed to extract mcu binary from \(assetName)\n", stderr)
+            exit(1)
+        }
+        extractedBinary = located.binary
+        payloadRoot = located.payloadRoot
+    } else {
+        extractedBinary = archiveLocalURL
+        payloadRoot = nil
+    }
+
+    try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: extractedBinary.path)
+
+    // Ensure Apple Silicon code signature validity before swapping live binary
+    let verifySign = Process()
+    verifySign.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+    verifySign.arguments = ["--verify", extractedBinary.path]
+    verifySign.standardOutput = FileHandle.nullDevice
+    verifySign.standardError = FileHandle.nullDevice
+    try? verifySign.run()
+    verifySign.waitUntilExit()
+    if verifySign.terminationStatus != 0 {
+        let resign = Process()
+        resign.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        resign.arguments = ["--force", "--sign", "-", extractedBinary.path]
+        resign.standardOutput = FileHandle.nullDevice
+        resign.standardError = FileHandle.nullDevice
+        try? resign.run()
+        resign.waitUntilExit()
+    }
+
+    // Smoke-test the candidate binary before replacing the installed binary
+    let probe = Process()
+    probe.executableURL = extractedBinary
+    probe.arguments = []
+    probe.standardOutput = FileHandle.nullDevice
+    probe.standardError = FileHandle.nullDevice
+    do {
+        try probe.run()
+        probe.waitUntilExit()
+    } catch {
+        fputs("Error verifying downloaded binary: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+    guard probe.terminationStatus == 0 else {
+        fputs("Error: Downloaded binary failed smoke check (exit \(probe.terminationStatus)). Aborting update.\n", stderr)
+        exit(1)
+    }
+
+    // Stop any running cursor daemon cleanly before replacing its executable on disk
+    if let oldDaemonPID = cursorDaemonPID() {
+        VirtualCursorClient.done()
+        usleep(200_000)
+        if kill(oldDaemonPID, 0) == 0 {
+            kill(oldDaemonPID, SIGTERM)
+            usleep(150_000)
+        }
+    }
+
+    let currentExeURL = (Bundle.main.executableURL?.resolvingSymlinksInPath()
+                         ?? URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath())
+    let targetDir = currentExeURL.deletingLastPathComponent()
+    let stagedURL = targetDir.appendingPathComponent(".mcu.update.\(ProcessInfo.processInfo.processIdentifier)")
+    do {
+        if fm.fileExists(atPath: stagedURL.path) { try fm.removeItem(at: stagedURL) }
+        try fm.copyItem(at: extractedBinary, to: stagedURL)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stagedURL.path)
+        _ = try fm.replaceItemAt(currentExeURL, withItemAt: stagedURL)
+    } catch {
+        try? fm.removeItem(at: stagedURL)
+        fputs("Error replacing executable at \(currentExeURL.path): \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+
+    // If running inside standard <root>/scripts/bin/mcu layout, refresh skill/docs/scripts while preserving user config
+    if let payloadRoot,
+       targetDir.lastPathComponent == "bin",
+       targetDir.deletingLastPathComponent().lastPathComponent == "scripts" {
+        let installRoot = targetDir.deletingLastPathComponent().deletingLastPathComponent()
+        for relItem in ["SKILL.md", "README.md", "resources", "examples", "references"] {
+            let src = payloadRoot.appendingPathComponent(relItem)
+            let dst = installRoot.appendingPathComponent(relItem)
+            guard fm.fileExists(atPath: src.path) else { continue }
+            try? fm.removeItem(at: dst)
+            try? fm.copyItem(at: src, to: dst)
+        }
+        let srcScriptsDir = payloadRoot.appendingPathComponent("scripts")
+        let dstScriptsDir = installRoot.appendingPathComponent("scripts")
+        if let items = try? fm.contentsOfDirectory(atPath: srcScriptsDir.path) {
+            for item in items where item != "bin" {
+                let src = srcScriptsDir.appendingPathComponent(item)
+                let dst = dstScriptsDir.appendingPathComponent(item)
+                try? fm.removeItem(at: dst)
+                try? fm.copyItem(at: src, to: dst)
+            }
+        }
+        let srcConfig = payloadRoot.appendingPathComponent("config/access_control.json")
+        let dstConfigDir = installRoot.appendingPathComponent("config")
+        let dstConfig = dstConfigDir.appendingPathComponent("access_control.json")
+        if fm.fileExists(atPath: srcConfig.path), !fm.fileExists(atPath: dstConfig.path) {
+            try? fm.createDirectory(at: dstConfigDir, withIntermediateDirectories: true)
+            try? fm.copyItem(at: srcConfig, to: dstConfig)
+        }
+        try? tagName.write(to: installRoot.appendingPathComponent(".mcu_version"), atomically: true, encoding: .utf8)
+    }
+
+    let verifiedMsg = checksumResult.verified ? " (SHA-256 verified)" : ""
+    print("Updated mcu to \(tagName)\(verifiedMsg) -> \(currentExeURL.path)")
+    exit(0)
+}
+
 let args = CommandLine.arguments
+
+if args.dropFirst().contains("--update") || (args.count >= 2 && args[1] == "update") {
+    performSelfUpdate(args: args)
+}
 
 guard args.count >= 2 else {
     printUsage()
@@ -5374,6 +6067,7 @@ case "click":
         var btn: CGMouseButton = .left
         var count = 1
         var autoClean = false
+        var hidMode: HIDFallbackMode = .auto
         var i = 4
         while i < args.count {
             if args[i] == "--app", i + 1 < args.count { targetApp = args[i + 1]; i += 1 }
@@ -5390,12 +6084,16 @@ case "click":
             } else if args[i] == "--count", i + 1 < args.count {
                 count = Int(args[i + 1]) ?? 1
                 i += 1
+            } else if args[i] == "--hid" {
+                hidMode = .force
+            } else if args[i] == "--no-hid" {
+                hidMode = .disabled
             } else if args[i] == "--done" || args[i] == "--clean" {
                 autoClean = true
             }
             i += 1
         }
-        let res = clickText(query: query, appName: targetApp, windowID: targetWID, button: btn, clickCount: count, autoClean: autoClean)
+        let res = clickText(query: query, appName: targetApp, windowID: targetWID, button: btn, clickCount: count, autoClean: autoClean, hidMode: hidMode)
         if !res.success {
             fputs(res.message + "\n", stderr)
             exit(1)
@@ -5539,11 +6237,12 @@ case "pip":
             }
         }
         try? FileManager.default.removeItem(atPath: kPiPLastErrorPath)
+        if let rw = resolvedWID {
+            try? FileManager.default.removeItem(atPath: pipReadyPath(for: rw))
+        }
         VirtualCursorClient.pipShow(appName: app, windowID: resolvedWID, anchorPID: anchorPID)
-        usleep(220_000)
-        if let pipErr = try? String(contentsOfFile: kPiPLastErrorPath, encoding: .utf8),
-           !pipErr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            fputs(pipErr.trimmingCharacters(in: .whitespacesAndNewlines) + "\n", stderr)
+        if let pipErr = awaitPiPActivation(windowID: resolvedWID) {
+            fputs(pipErr + "\n", stderr)
             exit(1)
         }
         print("PiP live preview activated for '\(app ?? (resolvedWID != nil ? "Window \(resolvedWID!)" : "Active Window"))'")
@@ -6006,6 +6705,7 @@ case "mouse":
         var targetWID: CGWindowID? = nil
         var targetApp: String? = nil
         var autoClean = false
+        var hidMode: HIDFallbackMode = .auto
 
         var i = 3
         if i < args.count, let px = Double(args[i]) { x = px; i += 1 }
@@ -6024,6 +6724,10 @@ case "mouse":
                 i += 1
             } else if args[i] == "--no-restore" {
                 restoreCursor = false
+            } else if args[i] == "--hid" {
+                hidMode = .force
+            } else if args[i] == "--no-hid" {
+                hidMode = .disabled
             } else if args[i] == "--done" || args[i] == "--clean" {
                 autoClean = true
             } else if args[i] == "--pid", i + 1 < args.count {
@@ -6044,7 +6748,7 @@ case "mouse":
             exit(1)
         }
         let pt = (x != nil && y != nil) ? CGPoint(x: x!, y: y!) : nil
-        let clickRes = clickMouseNonDisruptive(at: pt, button: btn, clickCount: count, restoreCursor: restoreCursor, targetPID: resolved.pid, windowID: resolved.windowID, appName: targetApp)
+        let clickRes = clickMouseNonDisruptive(at: pt, button: btn, clickCount: count, restoreCursor: restoreCursor, targetPID: resolved.pid, windowID: resolved.windowID, appName: targetApp, hidMode: hidMode)
         if autoClean {
             VirtualCursorClient.done()
         }
@@ -6339,6 +7043,9 @@ case "record":
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
         task.arguments = ["-v", output]
+        task.standardInput = FileHandle.nullDevice
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
         try? task.run()
         let pid = task.processIdentifier
         try? "\(pid)".write(toFile: "/tmp/mcu_record.pid", atomically: true, encoding: .utf8)
