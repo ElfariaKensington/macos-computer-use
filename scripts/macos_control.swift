@@ -4016,6 +4016,37 @@ private func raiseTargetWindowForHID(pid: pid_t, windowID: CGWindowID?) {
     }
 }
 
+private func popupMenuWindows(for pid: pid_t?) -> [CGWindowID] {
+    guard let pid else { return [] }
+    let all = getWindowsList(allLayers: true)
+    return all.compactMap { win in
+        guard let wPid = (win["pid"] as? Int).map(pid_t.init) ?? (win["pid"] as? pid_t),
+              wPid == pid,
+              let layer = win["layer"] as? Int, layer > 0, layer <= 200,
+              let b = win["bounds"] as? [String: CGFloat],
+              let wid = win["id"] as? Int else { return nil }
+        let w = b["width"] ?? 0
+        let h = b["height"] ?? 0
+        guard w >= 40 && h >= 20 else { return nil }
+        return CGWindowID(wid)
+    }
+}
+
+private func resolveKeyboardPiPTarget(explicitPID: pid_t?, explicitWID: CGWindowID?) -> (pid: pid_t?, windowID: CGWindowID?) {
+    let pid = resolveLastTargetPID(explicitPID: explicitPID)
+    if let explicitWID {
+        return (pid, explicitWID)
+    }
+    if let activeStr = try? String(contentsOfFile: "/tmp/mcu_active_pip_wid.txt", encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+       let activeInt = Int(activeStr) {
+        return (pid, CGWindowID(activeInt))
+    }
+    if let p = pid, let wid = firstWindowID(matchingPID: p) {
+        return (p, wid)
+    }
+    return (pid, nil)
+}
+
 private func postHIDClickFallback(
     at pt: CGPoint,
     button: CGMouseButton,
@@ -4058,7 +4089,7 @@ private func postHIDClickFallback(
         if i < clickCount { usleep(120_000) }
     }
 
-    usleep(60_000)
+    usleep(80_000)
     if restoreCursor {
         if let restoreEv = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: prevCursor, mouseButton: button) {
             restoreEv.post(tap: .cghidEventTap)
@@ -4066,7 +4097,10 @@ private func postHIDClickFallback(
         usleep(40_000)
     }
 
-    if let prev = prevApp,
+    // Do not steal focus back if this click just opened a native popup/NSMenu (reactivating another app immediately dismisses it).
+    let hasOpenPopup = !popupMenuWindows(for: targetPID).isEmpty
+    if !hasOpenPopup,
+       let prev = prevApp,
        prev.processIdentifier != myPID,
        prev.processIdentifier != daemonPID,
        prev.processIdentifier != targetPID {
@@ -4103,6 +4137,11 @@ func clickMouseNonDisruptive(
         return (false, validation.reason)
     }
 
+    if let pid = resolvedPID {
+        try? "\(pt.x),\(pt.y)".write(toFile: "/tmp/mcu_last_click_\(pid).txt", atomically: true, encoding: .utf8)
+        try? "\(pid)".write(toFile: "/tmp/mcu_last_target_pid.txt", atomically: true, encoding: .utf8)
+    }
+
     var deliveryMode = "Zero-focus background delivery"
     withAutoPiP(windowID: resolvedWID, appName: appName, pid: resolvedPID, point: pt) {
         // Glide our virtual cursor smoothly to the target point so movement is clearly visible!
@@ -4132,8 +4171,6 @@ func clickMouseNonDisruptive(
         var handledViaAX = false
         var axHitRole: String? = nil
         if let pid = resolvedPID, button == .left, hidMode != .force {
-            try? "\(pt.x),\(pt.y)".write(toFile: "/tmp/mcu_last_click_\(pid).txt", atomically: true, encoding: .utf8)
-            try? "\(pid)".write(toFile: "/tmp/mcu_last_target_pid.txt", atomically: true, encoding: .utf8)
             let appEl = AXUIElementCreateApplication(pid)
             var hitEl: AXUIElement?
             if AXUIElementCopyElementAtPosition(appEl, Float(pt.x), Float(pt.y), &hitEl) == .success, let leaf = hitEl {
@@ -4967,23 +5004,42 @@ func clickText(
     let targetPID = resolved.pid
 
     let runOCRAndClick: () -> (success: Bool, message: String) = {
-        guard let capture = (targetWID != nil ? VisionOCREngine.captureWindowImage(windowID: targetWID!) : VisionOCREngine.captureScreenImage()) else {
-            return (false, "Error: Failed to capture target image for OCR")
+        // Check any open popup/NSMenu windows owned by targetPID first (dropdown menus render in separate layer>0 windows).
+        var foundMatch: (targetPoint: CGPoint, matchedText: String, wid: CGWindowID?)? = nil
+        for popupWID in popupMenuWindows(for: targetPID) {
+            if let popCap = VisionOCREngine.captureWindowImage(windowID: popupWID) {
+                let (popItems, popRaw) = VisionOCREngine.recognize(cgImage: popCap.image, bounds: popCap.bounds, fast: true)
+                if let match = VisionOCREngine.findText(query: query, in: popItems, observations: popRaw, bounds: popCap.bounds) {
+                    foundMatch = (match.targetPoint, match.matchedText, popupWID)
+                    break
+                }
+            }
         }
 
-        let (items, rawObs) = VisionOCREngine.recognize(cgImage: capture.image, bounds: capture.bounds, fast: true)
-        guard let match = VisionOCREngine.findText(query: query, in: items, observations: rawObs, bounds: capture.bounds) else {
+        if foundMatch == nil {
+            guard let capture = (targetWID != nil ? VisionOCREngine.captureWindowImage(windowID: targetWID!) : VisionOCREngine.captureScreenImage()) else {
+                return (false, "Error: Failed to capture target image for OCR")
+            }
+
+            let (items, rawObs) = VisionOCREngine.recognize(cgImage: capture.image, bounds: capture.bounds, fast: true)
+            guard let match = VisionOCREngine.findText(query: query, in: items, observations: rawObs, bounds: capture.bounds) else {
+                return (false, "Error: Text '\(query)' not found in target")
+            }
+            foundMatch = (match.targetPoint, match.matchedText, targetWID)
+        }
+
+        guard let matched = foundMatch else {
             return (false, "Error: Text '\(query)' not found in target")
         }
 
-        let clickPoint = match.targetPoint
+        let clickPoint = matched.targetPoint
         let clickRes = clickMouseNonDisruptive(
             at: clickPoint,
             button: button,
             clickCount: clickCount,
             restoreCursor: true,
             targetPID: targetPID,
-            windowID: targetWID,
+            windowID: targetWID ?? matched.wid,
             appName: appName,
             hidMode: hidMode
         )
@@ -4995,7 +5051,7 @@ func clickText(
             VirtualCursorClient.done()
         }
 
-        return (true, "Clicked text '\(match.matchedText)' at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) \(targetPID != nil ? "[Target PID: \(targetPID!)]" : "")")
+        return (true, "Clicked text '\(matched.matchedText)' at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) \(targetPID != nil ? "[Target PID: \(targetPID!)]" : "")")
     }
 
     // Wrap OCR + click in Auto-PiP when target window is known upfront; otherwise let clickMouseNonDisruptive resolve the window under clickPoint.
@@ -5069,8 +5125,14 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> (text: String, isEr
         if let err = resolved.error {
             return (err, true)
         }
-        typeString(text, targetPID: resolved.pid)
-        return ("Typed: \"\(text)\"", false)
+        let kbTarget = resolveKeyboardPiPTarget(explicitPID: resolved.pid, explicitWID: resolved.windowID)
+        withAutoPiP(windowID: kbTarget.windowID, appName: app, pid: kbTarget.pid) {
+            typeString(text, targetPID: kbTarget.pid)
+        }
+        if (args["done"] as? Bool) == true {
+            VirtualCursorClient.done()
+        }
+        return ("Typed: \"\(text)\" \(kbTarget.pid != nil ? "[Target PID: \(kbTarget.pid!)]" : "")", false)
 
     case "key", "keyboard_key":
         guard let keyName = (args["name"] as? String ?? args["key"] as? String)?.lowercased() else {
@@ -5085,8 +5147,14 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> (text: String, isEr
         if let err = resolved.error {
             return (err, true)
         }
-        pressKey(keyCode: code, targetPID: resolved.pid)
-        return ("Pressed key '\(keyName)'", false)
+        let kbTarget = resolveKeyboardPiPTarget(explicitPID: resolved.pid, explicitWID: resolved.windowID)
+        withAutoPiP(windowID: kbTarget.windowID, appName: app, pid: kbTarget.pid) {
+            pressKey(keyCode: code, targetPID: kbTarget.pid)
+        }
+        if (args["done"] as? Bool) == true {
+            VirtualCursorClient.done()
+        }
+        return ("Pressed key '\(keyName)' \(kbTarget.pid != nil ? "[Target PID: \(kbTarget.pid!)]" : "")", false)
 
     case "hotkey", "keyboard_hotkey":
         guard let combo = args["combo"] as? String else {
@@ -5098,8 +5166,14 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> (text: String, isEr
         if let err = resolved.error {
             return (err, true)
         }
-        triggerHotkeyCombo(combo, targetPID: resolved.pid)
-        return ("Triggered hotkey combo '\(combo)' \(resolved.pid != nil ? "[Target PID: \(resolved.pid!)]" : "")", false)
+        let kbTarget = resolveKeyboardPiPTarget(explicitPID: resolved.pid, explicitWID: resolved.windowID)
+        withAutoPiP(windowID: kbTarget.windowID, appName: app, pid: kbTarget.pid) {
+            triggerHotkeyCombo(combo, targetPID: kbTarget.pid)
+        }
+        if (args["done"] as? Bool) == true {
+            VirtualCursorClient.done()
+        }
+        return ("Triggered hotkey combo '\(combo)' \(kbTarget.pid != nil ? "[Target PID: \(kbTarget.pid!)]" : "")", false)
 
     case "browser_open":
         guard let url = args["url"] as? String else { return ("Error: missing 'url'", true) }
@@ -5219,19 +5293,27 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> (text: String, isEr
         let widArg = (args["window"] as? NSNumber).map { CGWindowID($0.intValue) } ?? (args["wid"] as? NSNumber).map { CGWindowID($0.intValue) }
         let appArg = args["app"] as? String
         var targetWID = widArg
+        var targetPID: pid_t? = nil
         if widArg != nil || appArg != nil {
             let resolved = resolveExplicitTarget(appName: appArg, windowID: widArg, requireWindow: true)
             if let err = resolved.error {
                 return (err, true)
             }
             targetWID = resolved.windowID
+            targetPID = resolved.pid
         }
         let fast = (args["fast"] as? Bool) ?? true
 
         guard let capture = (targetWID != nil ? VisionOCREngine.captureWindowImage(windowID: targetWID!) : VisionOCREngine.captureScreenImage()) else {
             return ("Error: Failed to capture target image for OCR", true)
         }
-        let (items, _) = VisionOCREngine.recognize(cgImage: capture.image, bounds: capture.bounds, fast: fast)
+        var (items, _) = VisionOCREngine.recognize(cgImage: capture.image, bounds: capture.bounds, fast: fast)
+        for popupWID in popupMenuWindows(for: targetPID) {
+            if let popCap = VisionOCREngine.captureWindowImage(windowID: popupWID) {
+                let (popItems, _) = VisionOCREngine.recognize(cgImage: popCap.image, bounds: popCap.bounds, fast: fast)
+                items.insert(contentsOf: popItems, at: 0)
+            }
+        }
         if let data = try? JSONSerialization.data(withJSONObject: items.map { [
             "text": $0.text,
             "confidence": $0.confidence,
@@ -5257,8 +5339,10 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> (text: String, isEr
         let btn: CGMouseButton = (btnStr == "right") ? .right : ((btnStr == "middle" || btnStr == "center") ? .center : .left)
         let count = (args["count"] as? NSNumber)?.intValue ?? 1
         let done = (args["done"] as? Bool) ?? false
+        let hidArg = (args["hid"] as? Bool)
+        let hidMode: HIDFallbackMode = (hidArg == true) ? .force : ((hidArg == false) ? .disabled : .auto)
 
-        let result = clickText(query: query, appName: app, windowID: wid, button: btn, clickCount: count, autoClean: done)
+        let result = clickText(query: query, appName: app, windowID: wid, button: btn, clickCount: count, autoClean: done, hidMode: hidMode)
         return (result.message, !result.success)
 
     case "scroll", "mouse_scroll":
@@ -5320,6 +5404,14 @@ func runMCPServer() {
 
         switch method {
         case "initialize":
+            let mcpInstructions = """
+            Best practices for macos-computer-use:
+            1. Start by locating the target with `window_list` and/or `ocr` (or `pip_show` for visual oversight). Prefer `ocr` or `click_text` over saving and reading raw PNGs unless inspecting visual layout.
+            2. Pass `app` or `window` explicitly on every action (`click`, `click_text`, `type`, `key`, `hotkey`, `scroll`).
+            3. `click`, `click_text`, `move`, `type`, `key`, `hotkey`, and `scroll` automatically open/extend the floating PiP preview (10s idle timeout) and animate the virtual cursor—do NOT call `move` before `click` or run `open -a` manually.
+            4. When interacting with dropdowns/menus, pass `app` or `window`; `ocr` and `click_text` scan open popup menu layers automatically.
+            5. Call `done` when finished to dismiss PiP and the virtual cursor overlay immediately.
+            """
             let resp: [String: Any] = [
                 "jsonrpc": "2.0",
                 "id": id ?? 1,
@@ -5331,7 +5423,8 @@ func runMCPServer() {
                     "serverInfo": [
                         "name": "macos-computer-use",
                         "version": "1.0.0"
-                    ]
+                    ],
+                    "instructions": mcpInstructions
                 ]
             ]
             sendMCPResponse(resp)
@@ -5353,7 +5446,7 @@ func runMCPServer() {
             let tools: [[String: Any]] = [
                 [
                     "name": "click",
-                    "description": "Click or double-click at coordinates using virtual cursor with automatic PiP oversight, zero hardware mouse disruption, and zero focus stealing.",
+                    "description": "Click or double-click at coordinates using virtual cursor glide with automatic 10s PiP oversight, zero hardware mouse disruption, and zero focus stealing (falls back to cursor/focus-restoring HID click on CEF/Chromium/no-AX targets unless hid=false).",
                     "inputSchema": [
                         "type": "object",
                         "properties": [
@@ -5363,6 +5456,7 @@ func runMCPServer() {
                             "count": ["type": "integer", "default": 1],
                             "app": ["type": "string", "description": "Target application name if background"],
                             "window": ["type": "integer", "description": "Target window ID"],
+                            "hid": ["type": "boolean", "description": "Override HID click fallback (true=force HID, false=strict zero-focus AX/postToPid)"],
                             "done": ["type": "boolean", "description": "Also dismiss virtual cursor overlay after automatic PiP exit", "default": false]
                         ],
                         "required": ["x", "y"]
@@ -5384,24 +5478,28 @@ func runMCPServer() {
                 ],
                 [
                     "name": "type",
-                    "description": "Type text into target application without stealing focus.",
+                    "description": "Type text into target application with automatic PiP oversight and without stealing focus.",
                     "inputSchema": [
                         "type": "object",
                         "properties": [
                             "text": ["type": "string"],
-                            "app": ["type": "string"]
+                            "app": ["type": "string", "description": "Target application name"],
+                            "window": ["type": "integer", "description": "Target window ID"],
+                            "done": ["type": "boolean", "default": false]
                         ],
                         "required": ["text"]
                     ]
                 ],
                 [
                     "name": "key",
-                    "description": "Press a key by name (return, tab, space, escape, etc.)",
+                    "description": "Press a key by name (return, tab, space, escape, etc.) with automatic PiP oversight.",
                     "inputSchema": [
                         "type": "object",
                         "properties": [
                             "name": ["type": "string"],
-                            "app": ["type": "string"]
+                            "app": ["type": "string", "description": "Target application name"],
+                            "window": ["type": "integer", "description": "Target window ID"],
+                            "done": ["type": "boolean", "default": false]
                         ],
                         "required": ["name"]
                     ]
@@ -5446,7 +5544,7 @@ func runMCPServer() {
                 ],
                 [
                     "name": "click_text",
-                    "description": "Semantically find and click text inside a background window or on screen using Apple Vision OCR with automatic PiP oversight, virtual cursor animation, and zero user disruption.",
+                    "description": "Semantically find and click text inside a background window (including open popup menus/dropdowns) or on screen using Apple Vision OCR with automatic 10s PiP oversight and virtual cursor glide.",
                     "inputSchema": [
                         "type": "object",
                         "properties": [
@@ -5455,6 +5553,7 @@ func runMCPServer() {
                             "window": ["type": "integer", "description": "Target window ID"],
                             "button": ["type": "string", "enum": ["left", "right", "middle"], "default": "left"],
                             "count": ["type": "integer", "default": 1],
+                            "hid": ["type": "boolean", "description": "Override HID click fallback"],
                             "done": ["type": "boolean", "description": "Also dismiss virtual cursor overlay after automatic PiP exit", "default": false]
                         ],
                         "required": ["query"]
@@ -5522,13 +5621,14 @@ func runMCPServer() {
                 ],
                 [
                     "name": "hotkey",
-                    "description": "Trigger a shortcut combo like 'cmd+shift+n' directly in target application without stealing focus.",
+                    "description": "Trigger a shortcut combo like 'cmd+shift+n' in target application with automatic PiP oversight and without stealing focus.",
                     "inputSchema": [
                         "type": "object",
                         "properties": [
                             "combo": ["type": "string", "description": "Shortcut combo (e.g. 'cmd+shift+n', 'cmd+t', 'cmd+c')"],
                             "app": ["type": "string", "description": "Target application name"],
-                            "window": ["type": "integer", "description": "Target window ID"]
+                            "window": ["type": "integer", "description": "Target window ID"],
+                            "done": ["type": "boolean", "default": false]
                         ],
                         "required": ["combo"]
                     ]
