@@ -637,6 +637,198 @@ struct AccessControlEngine {
     }
 }
 
+// MARK: - Host Agent Resolver (Zero frontmostApplication Fallback)
+
+@_silgen_name("proc_pidpath")
+private func mcu_proc_pidpath(_ pid: pid_t, _ buffer: UnsafeMutableRawPointer?, _ buffersize: UInt32) -> Int32
+
+/// Positively identifies the GUI host agent app (.regular activationPolicy) that owns this CLI / MCP process.
+/// NEVER falls back to NSWorkspace.shared.frontmostApplication.
+final class HostAgentResolver {
+    static let shared = HostAgentResolver()
+
+    private let lock = NSLock()
+    private var cachedPID: pid_t?
+    private var mcpClientName: String?
+
+    private init() {
+        _ = resolveHostAppPID()
+    }
+
+    func recordMCPClient(name: String?) {
+        guard let raw = name?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return }
+        lock.lock()
+        mcpClientName = raw
+        if let pid = cachedPID, !Self.isValidRegularApp(pid) {
+            cachedPID = nil
+        }
+        lock.unlock()
+        _ = resolveHostAppPID()
+    }
+
+    func resolveHostAppPID() -> pid_t? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let cached = cachedPID, Self.isValidRegularApp(cached) {
+            return cached
+        }
+        cachedPID = nil
+
+        let env = ProcessInfo.processInfo.environment
+
+        // 1. Explicit override (e.g. MCU_ANCHOR_PID passed by wrapper or daemon).
+        if let raw = env["MCU_ANCHOR_PID"], let pid = Int32(raw), Self.isValidRegularApp(pid) {
+            cachedPID = pid
+            return pid
+        }
+
+        // 2. Exact IDE instance PID exported by VS Code / Cursor / Windsurf / Antigravity.
+        for key in ["VSCODE_PID", "CURSOR_PID", "WINDSURF_PID"] {
+            if let raw = env[key], let envPID = Int32(raw), envPID > 1 {
+                if Self.isValidRegularApp(envPID) {
+                    cachedPID = envPID
+                    return envPID
+                }
+                if let bundlePID = Self.outerRegularAppPID(forProcess: envPID) {
+                    cachedPID = bundlePID
+                    return bundlePID
+                }
+            }
+        }
+
+        // 3. Walk process ancestry up to PID 1: check both direct .regular app and outer .app bundle
+        //    (catches Electron/IDE helpers and language servers even when nested).
+        var pid = getppid()
+        var hops = 0
+        while pid > 1 && hops < 64 {
+            if Self.isValidRegularApp(pid) {
+                cachedPID = pid
+                return pid
+            }
+            if let bundlePID = Self.outerRegularAppPID(forProcess: pid) {
+                cachedPID = bundlePID
+                return bundlePID
+            }
+            let next = Self.parentPID(of: pid)
+            if next == pid || next <= 1 { break }
+            pid = next
+            hops += 1
+        }
+
+        // 4. Inherited bundle identifier or terminal/IDE environment (handles tmux / detached subshells).
+        if let cfBundle = env["__CFBundleIdentifier"],
+           let matched = Self.uniqueRunningRegularApp(matchingBundleIDs: [cfBundle], names: []) {
+            cachedPID = matched
+            return matched
+        }
+
+        if let termProgram = env["TERM_PROGRAM"],
+           let matched = Self.matchKnownProgram(termProgram) {
+            cachedPID = matched
+            return matched
+        }
+
+        // 5. MCP initialize params.clientInfo.name (only when uniquely matching one running .regular app).
+        if let clientName = mcpClientName,
+           let matched = Self.matchKnownProgram(clientName) {
+            cachedPID = matched
+            return matched
+        }
+
+        // NEVER guess frontmostApplication. Return nil so unanchored PiPs stay suppressed.
+        return nil
+    }
+
+    static func isValidRegularApp(_ pid: pid_t) -> Bool {
+        guard pid > 1,
+              let app = NSRunningApplication(processIdentifier: pid),
+              !app.isTerminated,
+              app.activationPolicy == .regular else {
+            return false
+        }
+        return true
+    }
+
+    private static func parentPID(of pid: pid_t) -> pid_t {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        let rc = sysctl(&mib, UInt32(mib.count), &info, &size, nil, 0)
+        guard rc == 0, size > 0 else { return 0 }
+        return info.kp_eproc.e_ppid
+    }
+
+    private static func executablePath(of pid: pid_t) -> String? {
+        var buffer = [CChar](repeating: 0, count: 4096)
+        let len = mcu_proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard len > 0 else { return nil }
+        return String(cString: buffer)
+    }
+
+    /// Maps ".../Foo.app/Contents/Frameworks/Foo Helper.app/Contents/MacOS/Foo Helper" -> running PID of "/.../Foo.app".
+    private static func outerRegularAppPID(forProcess pid: pid_t) -> pid_t? {
+        guard let execPath = executablePath(of: pid),
+              let range = execPath.range(of: ".app/") else {
+            return nil
+        }
+        let outerAppPath = String(execPath[..<range.upperBound].dropLast())
+        let outerURL = URL(fileURLWithPath: outerAppPath).standardizedFileURL
+        let matches = NSWorkspace.shared.runningApplications.filter { app in
+            guard !app.isTerminated, app.activationPolicy == .regular, let url = app.bundleURL else { return false }
+            return url.standardizedFileURL == outerURL
+        }
+        return matches.count == 1 ? matches[0].processIdentifier : matches.first?.processIdentifier
+    }
+
+    private static func uniqueRunningRegularApp(matchingBundleIDs bundleIDs: [String], names: [String]) -> pid_t? {
+        let lowerIDs = Set(bundleIDs.map { $0.lowercased() })
+        let lowerNames = Set(names.map { $0.lowercased() })
+        let regularApps = NSWorkspace.shared.runningApplications.filter {
+            !$0.isTerminated && $0.activationPolicy == .regular
+        }
+
+        let byBundle = regularApps.filter { app in
+            guard let bid = app.bundleIdentifier?.lowercased() else { return false }
+            return lowerIDs.contains(bid)
+        }
+        if byBundle.count == 1 { return byBundle[0].processIdentifier }
+
+        let byName = regularApps.filter { app in
+            let loc = app.localizedName?.lowercased() ?? ""
+            let bundleName = app.bundleURL?.deletingPathExtension().lastPathComponent.lowercased() ?? ""
+            return lowerNames.contains(loc) || lowerNames.contains(bundleName)
+        }
+        if byName.count == 1 { return byName[0].processIdentifier }
+        return nil
+    }
+
+    private static func matchKnownProgram(_ raw: String) -> pid_t? {
+        let token = raw.lowercased()
+        let catalog: [(keywords: [String], bundleIDs: [String], appNames: [String])] = [
+            (["cursor"], ["com.todesktop.230313mzl4w4u92"], ["cursor"]),
+            (["windsurf", "codeium"], ["com.exafunction.windsurf"], ["windsurf"]),
+            (["antigravity"], ["com.google.antigravity", "dev.antigravity.app"], ["antigravity"]),
+            (["claude desktop", "claude-ai", "claude_desktop", "claude"], ["com.anthropic.claudefordesktop"], ["claude"]),
+            (["vscode", "visual studio code", "code"], ["com.microsoft.vscode", "com.microsoft.vscodeinsiders"], ["visual studio code", "code"]),
+            (["zed"], ["dev.zed.zed", "dev.zed.zed-preview"], ["zed"]),
+            (["ghostty"], ["com.mitchellh.ghostty"], ["ghostty"]),
+            (["iterm"], ["com.googlecode.iterm2"], ["iterm2", "iterm"]),
+            (["apple_terminal", "terminal.app"], ["com.apple.terminal"], ["terminal"]),
+            (["warp", "warpterminal"], ["dev.warp.warp-stable"], ["warp"]),
+            (["wezterm"], ["com.github.wez.wezterm"], ["wezterm"]),
+            (["alacritty"], ["org.alacritty"], ["alacritty"]),
+            (["codex"], ["com.openai.codex"], ["codex"])
+        ]
+        for entry in catalog where entry.keywords.contains(where: { token.contains($0) }) {
+            if let pid = uniqueRunningRegularApp(matchingBundleIDs: entry.bundleIDs, names: entry.appNames) {
+                return pid
+            }
+        }
+        return nil
+    }
+}
+
 // MARK: - Virtual Cursor Client (IPC)
 
 struct VirtualCursorClient {
@@ -710,11 +902,18 @@ struct VirtualCursorClient {
         var extra: [String: Any] = ["x": pt.x, "y": pt.y]
         if let s = speed { extra["speed"] = s }
         if let d = duration { extra["duration"] = d }
+        if let pid = callerAppPID(), HostAgentResolver.isValidRegularApp(pid) {
+            extra["anchorPID"] = Int(pid)
+        }
         send(action: "move", extra: extra)
     }
     
     static func click(at pt: CGPoint, button: String = "left") {
-        send(action: "click", extra: ["x": pt.x, "y": pt.y, "button": button])
+        var extra: [String: Any] = ["x": pt.x, "y": pt.y, "button": button]
+        if let pid = callerAppPID(), HostAgentResolver.isValidRegularApp(pid) {
+            extra["anchorPID"] = Int(pid)
+        }
+        send(action: "click", extra: extra)
     }
     
     static func glow(color: String) {
@@ -725,7 +924,11 @@ struct VirtualCursorClient {
         var extra: [String: Any] = [:]
         if let a = appName { extra["app"] = a }
         if let w = windowID { extra["windowID"] = w }
-        if let pid = anchorPID ?? callerAppPID() { extra["anchorPID"] = Int(pid) }
+        if let pid = anchorPID ?? callerAppPID(), HostAgentResolver.isValidRegularApp(pid) {
+            extra["anchorPID"] = Int(pid)
+        } else {
+            extra["anchorUnresolved"] = true
+        }
         return extra
     }
 
@@ -755,26 +958,9 @@ struct VirtualCursorClient {
         send(action: "pip_undock")
     }
 
-    /// Walks up the process tree to the GUI app that launched this CLI (terminal, IDE, agent app).
+    /// Resolves the GUI host app that launched this CLI/MCP server without ever falling back to frontmostApplication.
     static func callerAppPID() -> pid_t? {
-        var pid = getppid()
-        var hops = 0
-        while pid > 1 && hops < 64 {
-            if let app = NSRunningApplication(processIdentifier: pid), app.activationPolicy == .regular {
-                return pid
-            }
-            pid = parentPID(of: pid)
-            hops += 1
-        }
-        return NSWorkspace.shared.frontmostApplication?.processIdentifier
-    }
-
-    private static func parentPID(of pid: pid_t) -> pid_t {
-        var info = kinfo_proc()
-        var size = MemoryLayout<kinfo_proc>.stride
-        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
-        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return 0 }
-        return info.kp_eproc.e_ppid
+        HostAgentResolver.shared.resolveHostAppPID()
     }
     
     static func pipHide(windowID: Int? = nil) {
@@ -1113,6 +1299,9 @@ final class HoverPiPView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     var previewRect: CGRect {
+        if dockSide != nil {
+            return CGRect(x: 4, y: 4, width: max(0, bounds.width - 8), height: max(0, bounds.height - 8))
+        }
         let m = Self.margin
         return CGRect(x: m.left, y: m.bottom,
                       width: max(0, bounds.width - m.left - m.right),
@@ -1457,16 +1646,9 @@ final class HoverPiPView: NSView {
     // MARK: - Live Edge Docking (Feature 3)
 
     private func layoutDockOverlay(for side: PiPDockSide) {
-        let tabWidth: CGFloat = 36.0
         let pBounds = previewLayer.bounds
-        let tabFrame: CGRect
-        switch side {
-        case .left:
-            tabFrame = CGRect(x: max(0, pBounds.width - tabWidth), y: 0, width: tabWidth, height: pBounds.height)
-        case .right:
-            tabFrame = CGRect(x: 0, y: 0, width: tabWidth, height: pBounds.height)
-        }
-        dockOverlay.frame = tabFrame
+        let tabWidth = max(24.0, pBounds.width)
+        dockOverlay.frame = pBounds
 
         let grabH: CGFloat = 28.0
         let grabW: CGFloat = 3.0
@@ -1892,7 +2074,15 @@ final class PiPStream: NSObject, SCStreamOutput, SCStreamDelegate {
 /// Owns every open PiP. PiPs pinned to the same corner of the same caller window form a deck: the newest
 /// is the front card in the corner, older ones sit behind it, slightly narrower, peeking out past its free
 /// edge. The front card is topmost in z-order, so each card's shadow falls onto the card behind it.
+struct AnchorWindowInfo: Equatable {
+    let windowID: Int
+    let rawRect: CGRect
+    /// Intersection of the host window rect with its monitor's visibleFrame (excludes menu bar, Dock, and off-screen overhang).
+    let clampedRect: CGRect
+}
+
 final class PiPManager {
+    static let minUsableAnchorSize = CGSize(width: 200, height: 140)
     /// Each card behind the front one shifts this far into the caller window (sideways and down/up),
     /// so it shows an L-shaped strip that is easy to see and click.
     /// Collapsed deck: each card behind is this much smaller and shows this much edge past the one in front.
@@ -1965,14 +2155,127 @@ final class PiPManager {
     }
     static let visibleDepth = 3
     private(set) var pips: [PiPWindowController] = []
-    private var followTimer: Timer?
+    private var followTimer: DispatchSourceTimer?
     private var mouseMonitors: [Any] = []
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var lastAnchorWindows: [pid_t: AnchorWindowInfo] = [:]
+    private var lastActiveRegularPID: pid_t? = NSWorkspace.shared.frontmostApplication?.processIdentifier
     private var autoPiPTimer: Timer?
     private var autoManagedTargets: Set<CGWindowID> = []
     private var isAutoPiPInFlight: Bool = false
     private var lastAutoPiPTimeout: TimeInterval = autoPiPTimeoutSeconds()
 
+    var hasShowingPiP: Bool { pips.contains { $0.isShowing } }
+
+    init() {
+        installContainmentObservers()
+    }
+
+    func installContainmentObservers() {
+        guard workspaceObservers.isEmpty else { return }
+        let nc = NSWorkspace.shared.notificationCenter
+
+        if let front = NSWorkspace.shared.frontmostApplication, front.activationPolicy == .regular {
+            lastActiveRegularPID = front.processIdentifier
+        }
+
+        // Fires BEFORE the incoming app finishes drawing — zero-frame conceal on Cmd-Tab / app switch!
+        workspaceObservers.append(
+            nc.addObserver(forName: NSWorkspace.didDeactivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+                guard let self else { return }
+                if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+                    let deactivatedPID = app.processIdentifier
+                    for pip in self.pips where pip.anchorPID == deactivatedPID {
+                        pip.concealPanel()
+                    }
+                }
+                self.restackAll()
+                FancyCursorDaemon.sharedIfInitialized?.enforceContainment()
+            }
+        )
+
+        workspaceObservers.append(
+            nc.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+                guard let self else { return }
+                if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                   app.activationPolicy == .regular {
+                    self.lastActiveRegularPID = app.processIdentifier
+                }
+                self.restackAll()
+                FancyCursorDaemon.sharedIfInitialized?.enforceContainment()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                    self?.restackAll()
+                    FancyCursorDaemon.sharedIfInitialized?.enforceContainment()
+                }
+            }
+        )
+
+        workspaceObservers.append(
+            nc.addObserver(forName: NSWorkspace.didHideApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.restackAll()
+                FancyCursorDaemon.sharedIfInitialized?.enforceContainment()
+            }
+        )
+
+        workspaceObservers.append(
+            nc.addObserver(forName: NSWorkspace.didUnhideApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.restackAll()
+            }
+        )
+
+        workspaceObservers.append(
+            nc.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.restackAll()
+                FancyCursorDaemon.sharedIfInitialized?.enforceContainment()
+            }
+        )
+
+        workspaceObservers.append(
+            nc.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+                guard let self,
+                      let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+                let deadPID = app.processIdentifier
+                if self.lastActiveRegularPID == deadPID { self.lastActiveRegularPID = nil }
+                self.closeAllPiPs(anchoredTo: deadPID)
+                FancyCursorDaemon.sharedIfInitialized?.enforceContainment()
+            }
+        )
+    }
+
+    private func closeAllPiPs(anchoredTo deadPID: pid_t) {
+        let doomed = pips.filter { $0.anchorPID == deadPID }
+        for pip in doomed {
+            pip.hide()
+        }
+        lastAnchorWindows.removeValue(forKey: deadPID)
+    }
+
+    /// True ONLY when `pid` is a valid live .regular app, currently active in foreground, not hidden,
+    /// and has a usable standard window composited on the CURRENT active Space.
+    func activeAnchorWindow(for pid: pid_t?) -> AnchorWindowInfo? {
+        guard let pid, pid > 1,
+              let hostApp = NSRunningApplication(processIdentifier: pid),
+              !hostApp.isTerminated,
+              !hostApp.isHidden,
+              hostApp.activationPolicy == .regular else {
+            return nil
+        }
+
+        let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let daemonPID = getpid()
+        let hostIsFrontmost = (frontPID == pid) || (frontPID == daemonPID && lastActiveRegularPID == pid)
+        guard hostIsFrontmost else { return nil }
+
+        return PiPWindowController.frontWindow(of: pid)
+    }
+
     func show(appName: String?, windowID: CGWindowID?, anchorPID: pid_t?) {
+        guard let validAnchorPID = anchorPID, HostAgentResolver.isValidRegularApp(validAnchorPID) else {
+            let msg = "Error: PiP preview suppressed — could not anchor to a running GUI host agent app."
+            try? msg.write(toFile: kPiPLastErrorPath, atomically: true, encoding: .utf8)
+            clearActivePiPStateFiles()
+            return
+        }
         guard let target = windowID ?? appName.flatMap(PiPWindowController.firstWindowID(matchingApp:)) else {
             let msg = "Error: Cannot open PiP preview — no valid target window found"
             try? msg.write(toFile: kPiPLastErrorPath, atomically: true, encoding: .utf8)
@@ -1981,14 +2284,15 @@ final class PiPManager {
         }
         // Manual `pip show` promotes the card out of auto-hide management.
         autoManagedTargets.remove(target)
-        if pips.contains(where: { $0.targetWindowID == target }) {
+        if let existing = pips.first(where: { $0.targetWindowID == target }) {
+            existing.updateAnchorPID(validAnchorPID)
             restackAll()
             return
         }
         let pip = PiPWindowController(manager: self)
         pips.append(pip)
         zOrder.append(ObjectIdentifier(pip))
-        guard pip.show(targetWindowID: target, anchorPID: anchorPID) else {
+        guard pip.show(targetWindowID: target, anchorPID: validAnchorPID) else {
             pips.removeAll { $0 === pip }
             zOrder.removeAll { $0 == ObjectIdentifier(pip) }
             clearActivePiPStateFiles(matchingWindowID: Int(target))
@@ -2006,6 +2310,12 @@ final class PiPManager {
         autoPiPTimer = nil
         isAutoPiPInFlight = true
 
+        guard let validAnchorPID = anchorPID, HostAgentResolver.isValidRegularApp(validAnchorPID) else {
+            isAutoPiPInFlight = false
+            clearActivePiPStateFiles()
+            return
+        }
+
         guard let target = windowID ?? appName.flatMap(PiPWindowController.firstWindowID(matchingApp:)) else {
             isAutoPiPInFlight = false
             clearActivePiPStateFiles()
@@ -2022,6 +2332,7 @@ final class PiPManager {
         }
 
         if let existing = pips.first(where: { $0.targetWindowID == target }) {
+            existing.updateAnchorPID(validAnchorPID)
             if depth(for: existing) > 0 {
                 bringToFront(existing)
             } else {
@@ -2037,7 +2348,7 @@ final class PiPManager {
         let pip = PiPWindowController(manager: self)
         pips.append(pip)
         zOrder.append(ObjectIdentifier(pip))
-        guard pip.show(targetWindowID: target, anchorPID: anchorPID) else {
+        guard pip.show(targetWindowID: target, anchorPID: validAnchorPID) else {
             pips.removeAll { $0 === pip }
             zOrder.removeAll { $0 == ObjectIdentifier(pip) }
             isAutoPiPInFlight = false
@@ -2219,70 +2530,96 @@ final class PiPManager {
         }
     }
 
-    /// For each caller: its PiPs right above the caller window, back cards first, front cards on top.
+    /// Strictly confines PiPs to their active, frontmost host agent app on the current Space.
+    /// When the host app is inactive, hidden, minimized, or on another Space, PiPs are immediately ordered out
+    /// while keeping their ScreenCaptureKit stream warm for instant re-appearance when returning.
     func restackAll() {
-        let groups = Dictionary(grouping: pips.filter { $0.isShowing && !$0.isWaitingForInitialFrame }) { $0.anchorPID ?? -1 }
-        let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        for pip in pips where pip.anchorPID == nil || (pip.anchorPID ?? 0) <= 1 {
+            pip.concealPanel()
+        }
+
+        let readyPiPs = pips.filter { $0.isShowing && !$0.isWaitingForInitialFrame && ($0.anchorPID ?? 0) > 1 }
+        let groups = Dictionary(grouping: readyPiPs) { $0.anchorPID! }
+
         for (pid, group) in groups {
             let ordered = group.sorted { zIndex($0) < zIndex($1) }   // back ... front
 
-            // Caller app in use: float above everything it has, so clicking/navigating inside it can never
-            // cover the PiPs (the cause of the flicker). Otherwise sit in the normal stack right above the
-            // caller window, so other apps cover the PiPs together with it.
-            let callerActive = pid == -1 || pid == frontmostPID
-            if callerActive {
+            guard let anchor = activeAnchorWindow(for: pid) else {
+                lastAnchorWindows.removeValue(forKey: pid)
                 for pip in ordered {
-                    pip.setLevel(.floating)
-                    pip.orderFront()
+                    pip.concealPanel()
                 }
                 continue
             }
 
-            guard let anchor = PiPWindowController.frontWindow(of: pid) else { continue }
-            _ = anchor
+            let previousAnchor = lastAnchorWindows[pid]
+            lastAnchorWindows[pid] = anchor
+
             for pip in ordered {
-                pip.setLevel(.floating)
-                pip.orderFront()
+                pip.reclampAndReveal(inside: anchor, previousAnchor: previousAnchor)
             }
         }
     }
 
-    private func startFollowing() {
+    func startFollowing() {
+        installContainmentObservers()
+        if mouseMonitors.isEmpty {
+            let events: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .leftMouseDown]
+            let update: (NSEvent) -> Void = { [weak self] event in
+                let point = event.window.map { $0.convertPoint(toScreen: event.locationInWindow) } ?? event.locationInWindow
+                self?.pips.forEach { $0.updateMousePassThrough(at: point) }
+            }
+            if let global = NSEvent.addGlobalMonitorForEvents(matching: events, handler: update) { mouseMonitors.append(global) }
+            if let local = NSEvent.addLocalMonitorForEvents(matching: events, handler: { update($0); return $0 }) { mouseMonitors.append(local) }
+        }
         guard followTimer == nil else { return }
-        followTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + .milliseconds(33), repeating: .milliseconds(33), leeway: .milliseconds(8))
+        timer.setEventHandler { [weak self] in
             guard let self else { return }
-            var moved = false
-            for pip in self.pips {
-                moved = pip.anchorMoved() || moved
-                pip.verifyHover()
+            if self.pips.isEmpty {
+                self.stopFollowing()
+                return
             }
-            if moved { self.relayout(animated: false) }
-            self.restackAll()
+            self.tickFollow()
         }
-        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appActivated(_:)),
-                                                          name: NSWorkspace.didActivateApplicationNotification, object: nil)
-        let events: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .leftMouseDown]
-        let update: (NSEvent) -> Void = { [weak self] event in
-            // Where this event happened, in screen coordinates.
-            let point = event.window.map { $0.convertPoint(toScreen: event.locationInWindow) } ?? event.locationInWindow
-            self?.pips.forEach { $0.updateMousePassThrough(at: point) }
-        }
-        if let global = NSEvent.addGlobalMonitorForEvents(matching: events, handler: update) { mouseMonitors.append(global) }
-        if let local = NSEvent.addLocalMonitorForEvents(matching: events, handler: { update($0); return $0 }) { mouseMonitors.append(local) }
+        followTimer = timer
+        timer.resume()
     }
 
-    private func stopFollowing() {
+    func stopFollowing() {
         mouseMonitors.forEach { NSEvent.removeMonitor($0) }
         mouseMonitors.removeAll()
-        followTimer?.invalidate()
+        followTimer?.cancel()
         followTimer = nil
-        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
-    @objc private func appActivated(_ note: Notification) {
-        // React right away when focus changes instead of waiting for the next follow tick.
-        restackAll()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in self?.restackAll() }
+    private func tickFollow() {
+        let activePIDs = Set(pips.compactMap { $0.anchorPID })
+        var needsRestack = false
+
+        for pid in activePIDs {
+            let current = activeAnchorWindow(for: pid)
+            let previous = lastAnchorWindows[pid]
+            if current != previous {
+                needsRestack = true
+                break
+            }
+        }
+
+        if needsRestack {
+            restackAll()
+        } else {
+            for pip in pips {
+                if pip.isPanelVisible {
+                    if pip.anchorPID == nil || activeAnchorWindow(for: pip.anchorPID) == nil || !pip.isPanelOnActiveSpace {
+                        pip.concealPanel()
+                    } else {
+                        pip.verifyHover()
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2290,6 +2627,8 @@ final class PiPManager {
 final class PiPWindowController: PiPInteractionDelegate {
     private static let inset: CGFloat = 14
     private static let minWidth: CGFloat = 200
+    private static let minEdgeInset: CGFloat = 8
+    private static let dockedTabWidth: CGFloat = 44
 
     private weak var manager: PiPManager?
     private var panel: NSPanel?
@@ -2315,12 +2654,35 @@ final class PiPWindowController: PiPInteractionDelegate {
     private var waitingForInitialFrame = false
     var isWaitingForInitialFrame: Bool { waitingForInitialFrame }
     private var consecutiveCaptureFailures = 0
+    private var hasPlayedOpenAnimation = false
+    private var customNormalizedOrigin: CGPoint?
+    private var dockedNormalizedY: CGFloat = 0.72
 
     init(manager: PiPManager) { self.manager = manager }
 
     var pinnedCorner: PiPCorner { corner }
     var isFrontmost: Bool { manager?.isTop(self) ?? true }
     var windowNumber: Int { panel?.windowNumber ?? 0 }
+    var isPanelVisible: Bool { panel?.isVisible ?? false }
+    var isPanelOnActiveSpace: Bool { panel?.isOnActiveSpace ?? false }
+
+    func updateAnchorPID(_ pid: pid_t) {
+        guard HostAgentResolver.isValidRegularApp(pid) else { return }
+        anchorPID = pid
+    }
+
+    /// Immediately removes the PiP panel from screen WITHOUT stopping ScreenCaptureKit.
+    func concealPanel() {
+        guard let panel else { return }
+        fadeTimer?.invalidate()
+        fadeTimer = nil
+        if panel.level != .normal {
+            panel.level = .normal
+        }
+        if panel.isVisible {
+            panel.orderOut(nil)
+        }
+    }
 
     func animateRaise() {
         pipView?.animateRaise()
@@ -2389,9 +2751,16 @@ final class PiPWindowController: PiPInteractionDelegate {
             try? msg.write(toFile: kPiPLastErrorPath, atomically: true, encoding: .utf8)
             return false
         }
+        guard let validAnchorPID = anchorPID, HostAgentResolver.isValidRegularApp(validAnchorPID) else {
+            let msg = "Error: PiP preview suppressed — could not anchor to a running GUI host agent app."
+            try? msg.write(toFile: kPiPLastErrorPath, atomically: true, encoding: .utf8)
+            return false
+        }
         try? FileManager.default.removeItem(atPath: kPiPLastErrorPath)
         self.targetWindowID = wid
-        self.anchorPID = anchorPID
+        self.anchorPID = validAnchorPID
+        self.hasPlayedOpenAnimation = false
+        self.customNormalizedOrigin = nil
 
         let initial = Self.capture(windowID: wid)
         var resolvedBounds: CGRect? = nil
@@ -2413,14 +2782,13 @@ final class PiPWindowController: PiPInteractionDelegate {
         let targetHeight = resolvedBounds?.height ?? CGFloat(initial?.height ?? 700) / 2.0
         aspect = targetHeight / max(targetWidth, 1)
 
-        // Every PiP is sized proportionally to its own target window (never forced to equal dimensions),
-        // pinned to the caller's top-right corner with cascading offsets.
-        let anchor = anchorRect()
+        // Size proportionally to the target window, bounded strictly inside the host agent window.
+        let anchor = Self.frontWindow(of: validAnchorPID)?.clampedRect ?? CGRect(x: 0, y: 0, width: 1200, height: 800)
         lastAnchor = anchor
         corner = .topRight
         var width = targetWidth * 0.27
         let maxWidth = min(anchor.width * 0.45, 500)
-        let minWidth = max(anchor.width * 0.16, 220)
+        let minWidth = min(max(anchor.width * 0.16, 200), maxWidth)
         width = min(max(width, minWidth), maxWidth)
         var height = width * aspect
         let maxHeight = anchor.height * 0.52
@@ -2428,11 +2796,11 @@ final class PiPWindowController: PiPInteractionDelegate {
             height = maxHeight
             width = height / max(aspect, 0.2)
         }
-        previewSize = CGSize(width: round(width), height: round(height))
+        previewSize = fittedPreviewSize(for: CGSize(width: round(width), height: round(height)), in: anchor)
 
         let panel = makePanel()
         self.panel = panel
-        let frame = slotFrame()
+        let frame = targetContainedPanelFrame(in: anchor)
         let view = HoverPiPView(frame: NSRect(origin: .zero, size: frame.size), image: initial)
         view.autoresizingMask = [NSView.AutoresizingMask.width, NSView.AutoresizingMask.height]
         view.interactionDelegate = self
@@ -2448,16 +2816,18 @@ final class PiPWindowController: PiPInteractionDelegate {
         hasValidPreview = (initial != nil)
         waitingForInitialFrame = (initial == nil)
         consecutiveCaptureFailures = 0
-        panel.setFrame(frame, display: !waitingForInitialFrame)
+        panel.setFrame(frame, display: false)
         if hasValidPreview {
             try? "ready".write(toFile: pipReadyPath(for: Int(wid)), atomically: true, encoding: .utf8)
         }
 
         isShowing = true
         panel.alphaValue = 0
+        // Delegate visibility strictly to PiPManager.restackAll(): if host app is NOT active/visible,
+        // the panel remains ordered out until the user switches back to the host app.
+        manager?.startFollowing()
         if !waitingForInitialFrame {
-            if anchorPID != nil { panel.orderBack(nil) } else { panel.orderFrontRegardless() }
-            playOpenTransition(for: panel)
+            manager?.restackAll()
         }
 
         startCapture()
@@ -2465,11 +2835,47 @@ final class PiPWindowController: PiPInteractionDelegate {
     }
 
     private func revealPanelIfDeferred() {
-        guard isShowing, waitingForInitialFrame, let panel else { return }
+        guard isShowing, waitingForInitialFrame, panel != nil else { return }
         waitingForInitialFrame = false
-        if anchorPID != nil { panel.orderBack(nil) } else { panel.orderFrontRegardless() }
         manager?.relayout(animated: true, except: self)
-        playOpenTransition(for: panel)
+        manager?.restackAll()
+    }
+
+    /// Called by PiPManager.restackAll() ONLY when host agent app is verified frontmost on the active Space.
+    func reclampAndReveal(inside anchor: AnchorWindowInfo, previousAnchor: AnchorWindowInfo?) {
+        guard let panel, isShowing, !waitingForInitialFrame else { return }
+
+        lastAnchor = anchor.clampedRect
+
+        // If host window moved onto another Space while panel had affinity to an old Space, reset Space affinity cleanly.
+        if panel.isVisible && !panel.isOnActiveSpace {
+            panel.orderOut(nil)
+        }
+
+        if !interacting {
+            let targetPanelRect = targetContainedPanelFrame(in: anchor.clampedRect)
+            if panel.frame != targetPanelRect {
+                setPanelFrame(targetPanelRect)
+            }
+        }
+
+        panel.level = .floating
+        if !panel.isVisible {
+            if !hasPlayedOpenAnimation {
+                hasPlayedOpenAnimation = true
+                panel.alphaValue = 0
+                panel.order(.above, relativeTo: anchor.windowID)
+                playOpenTransition(for: panel)
+            } else {
+                panel.alphaValue = 1
+                panel.order(.above, relativeTo: anchor.windowID)
+            }
+        } else {
+            if fadeTimer == nil && panel.alphaValue < 1 {
+                panel.alphaValue = 1
+            }
+            panel.order(.above, relativeTo: anchor.windowID)
+        }
     }
 
     /// Live capture through ScreenCaptureKit: real-time frames, and macOS marks the captured window/app with
@@ -2552,13 +2958,14 @@ final class PiPWindowController: PiPInteractionDelegate {
                             backing: .buffered, defer: false)
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        // Normal level: PiPs live in the regular window stack, right above their caller (see restackAll()).
         panel.level = .normal
         panel.hidesOnDeactivate = false
         panel.hasShadow = false
         panel.acceptsMouseMovedEvents = true
         panel.isMovable = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        // CRITICAL: NO .canJoinAllSpaces! Stays bound strictly to the host agent app's Space
+        // (supports native fullscreen host via .fullScreenAuxiliary).
+        panel.collectionBehavior = [.fullScreenAuxiliary, .transient, .ignoresCycle]
         return panel
     }
 
@@ -2586,21 +2993,95 @@ final class PiPWindowController: PiPInteractionDelegate {
 
     // MARK: Geometry
 
-    /// Where this PiP's preview belongs. PiPs on the same corner cascade like windows: the oldest sits in the
-    /// caller's corner, each newer one shifted into the caller window by one step, so the PiPs behind show
-    /// their top and side edges. Clicking one only raises it; nothing moves.
-    private func previewFrame(in anchor: CGRect) -> CGRect {
-        let inset = Self.inset
-        let size = previewSize
-        let step = CGFloat(manager?.cascadeIndex(for: self) ?? 0)
-        let dx = PiPManager.cascadeStep.dx * step
-        let dy = PiPManager.cascadeStep.dy * step
-        let x = corner.isLeft ? anchor.minX + inset + dx : anchor.maxX - inset - size.width - dx
-        let y = corner.isTop ? anchor.maxY - inset - size.height - dy : anchor.minY + inset + dy
-        return CGRect(origin: CGPoint(x: x, y: y), size: size).integral
+    /// Computes panel outsets around a given preview rect so panel borders/handles stay 100% inside `anchor`.
+    private func panelOutsets() -> NSEdgeInsets {
+        HoverPiPView.margin
     }
 
-    func slotFrame() -> CGRect { panelFrame(for: previewFrame(in: lastAnchor)) }
+    /// Shrinks previewSize proportionally if the host agent window is narrower/shorter than the PiP.
+    func fittedPreviewSize(for desired: CGSize, in anchor: CGRect) -> CGSize {
+        let out = panelOutsets()
+        let margin = Self.minEdgeInset
+        let maxW = max(96, anchor.width - (margin * 2) - out.left - out.right)
+        let maxH = max(72, anchor.height - (margin * 2) - out.top - out.bottom)
+
+        guard desired.width > 0, desired.height > 0 else {
+            return CGSize(width: min(240, maxW), height: min(160, maxH))
+        }
+        let scale = min(1.0, min(maxW / desired.width, maxH / desired.height))
+        return CGSize(
+            width: floor(desired.width * scale),
+            height: floor(desired.height * scale)
+        )
+    }
+
+    /// Strictly clamps a preview rect so the resulting `panelFrame(for:)` is 100% inside `anchor`.
+    func clampPreviewRect(_ candidate: CGRect, in anchor: CGRect) -> CGRect {
+        let out = panelOutsets()
+        let margin = Self.minEdgeInset
+        let fitted = fittedPreviewSize(for: candidate.size, in: anchor)
+
+        let minX = anchor.minX + margin + out.left
+        let maxX = max(minX, anchor.maxX - margin - out.right - fitted.width)
+        let minY = anchor.minY + margin + out.bottom
+        let maxY = max(minY, anchor.maxY - margin - out.top - fitted.height)
+
+        let clampedX = min(max(candidate.origin.x, minX), maxX)
+        let clampedY = min(max(candidate.origin.y, minY), maxY)
+        return CGRect(origin: CGPoint(x: clampedX, y: clampedY), size: fitted).integral
+    }
+
+    /// Final safety clamp on any NSPanel frame so not a single pixel crosses outside `anchor`.
+    func clampRawPanelFrame(_ pf: CGRect, in anchor: CGRect) -> CGRect {
+        let w = min(pf.width, anchor.width)
+        let h = min(pf.height, anchor.height)
+        let x = min(max(pf.origin.x, anchor.minX), anchor.maxX - w)
+        let y = min(max(pf.origin.y, anchor.minY), anchor.maxY - h)
+        return CGRect(x: x, y: y, width: w, height: h).integral
+    }
+
+    /// Where this PiP's preview belongs, strictly contained inside `anchor`.
+    private func previewFrame(in anchor: CGRect) -> CGRect {
+        let out = panelOutsets()
+        let inset = max(Self.inset, Self.minEdgeInset)
+        let size = fittedPreviewSize(for: previewSize, in: anchor)
+
+        if let norm = customNormalizedOrigin {
+            let minX = anchor.minX + Self.minEdgeInset + out.left
+            let maxX = max(minX, anchor.maxX - Self.minEdgeInset - out.right - size.width)
+            let minY = anchor.minY + Self.minEdgeInset + out.bottom
+            let maxY = max(minY, anchor.maxY - Self.minEdgeInset - out.top - size.height)
+            let x = minX + (maxX - minX) * min(max(norm.x, 0), 1)
+            let y = minY + (maxY - minY) * min(max(norm.y, 0), 1)
+            return clampPreviewRect(CGRect(origin: CGPoint(x: x, y: y), size: size), in: anchor)
+        }
+
+        let step = CGFloat(manager?.cascadeIndex(for: self) ?? 0)
+        let slackX = max(0, anchor.width - (inset * 2) - out.left - out.right - size.width)
+        let slackY = max(0, anchor.height - (inset * 2) - out.top - out.bottom - size.height)
+        let rawDX = PiPManager.cascadeStep.dx * step
+        let rawDY = PiPManager.cascadeStep.dy * step
+        let dx = slackX > 1 ? rawDX.truncatingRemainder(dividingBy: slackX + 1) : 0
+        let dy = slackY > 1 ? rawDY.truncatingRemainder(dividingBy: slackY + 1) : 0
+
+        let x = corner.isLeft
+            ? anchor.minX + inset + out.left + dx
+            : anchor.maxX - inset - out.right - size.width - dx
+        let y = corner.isTop
+            ? anchor.maxY - inset - out.top - size.height - dy
+            : anchor.minY + inset + out.bottom + dy
+        return clampPreviewRect(CGRect(origin: CGPoint(x: x, y: y), size: size), in: anchor)
+    }
+
+    func targetContainedPanelFrame(in anchor: CGRect) -> CGRect {
+        if let side = dockSide {
+            return dockedPanelFrame(side: side, in: anchor)
+        }
+        let preview = previewFrame(in: anchor)
+        return clampRawPanelFrame(panelFrame(for: preview), in: anchor)
+    }
+
+    func slotFrame() -> CGRect { targetContainedPanelFrame(in: lastAnchor) }
 
     private func panelFrame(for preview: CGRect) -> CGRect {
         let m = HoverPiPView.margin
@@ -2610,31 +3091,39 @@ final class PiPWindowController: PiPInteractionDelegate {
 
     private func currentPreviewFrame() -> CGRect {
         guard let panel else { return .zero }
+        if isDocked {
+            return panel.frame.insetBy(dx: 4, dy: 4)
+        }
         let m = HoverPiPView.margin
         let f = panel.frame
         return CGRect(x: f.minX + m.left, y: f.minY + m.bottom,
-                      width: f.width - m.left - m.right, height: f.height - m.top - m.bottom)
+                      width: max(0, f.width - m.left - m.right), height: max(0, f.height - m.top - m.bottom))
     }
 
-    /// Frontmost on-screen window of the calling app, in Cocoa screen coordinates.
-    private func anchorRect() -> CGRect {
-        if let pid = anchorPID, let window = Self.frontWindow(of: pid) { return window.rect }
-        return (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+    /// Frontmost on-screen window of the calling host agent app, strictly clamped to its screen's visibleFrame.
+    /// Returns nil when the host app has no active frontmost window (NEVER falls back to NSScreen.main!).
+    private func currentAnchorRect() -> CGRect? {
+        guard let pid = anchorPID else { return nil }
+        return manager?.activeAnchorWindow(for: pid)?.clampedRect ?? Self.frontWindow(of: pid)?.clampedRect
     }
 
     /// Re-reads the caller window's frame; true if it moved or resized.
     func anchorMoved() -> Bool {
-        guard isShowing else { return false }
-        let anchor = anchorRect()
+        guard isShowing, let anchor = currentAnchorRect() else { return false }
         guard anchor != lastAnchor else { return false }
         lastAnchor = anchor
         return true
     }
 
-    /// Glides (or jumps) to this PiP's slot. Skipped while the user is dragging it or docked.
+    /// Glides (or jumps) to this PiP's slot inside the host app window. Skipped while dragging or docked.
     func moveToSlot(animated: Bool) {
         guard isShowing, !interacting, !isDocked, let panel else { return }
-        let target = slotFrame()
+        guard let anchor = currentAnchorRect() else {
+            concealPanel()
+            return
+        }
+        lastAnchor = anchor
+        let target = targetContainedPanelFrame(in: anchor)
         guard target != panel.frame else { return }
         guard animated else { snapTimer?.invalidate(); setPanelFrame(target); return }
         animate(to: target, completion: nil)
@@ -2652,8 +3141,10 @@ final class PiPWindowController: PiPInteractionDelegate {
             let t = min(1, (CACurrentMediaTime() - begin) / duration)
             let e = CGFloat(1 - pow(1 - t, 3))
             func lerp(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * e }
-            self.setPanelFrame(CGRect(x: lerp(start.minX, target.minX), y: lerp(start.minY, target.minY),
-                                      width: lerp(start.width, target.width), height: lerp(start.height, target.height)).integral)
+            let raw = CGRect(x: lerp(start.minX, target.minX), y: lerp(start.minY, target.minY),
+                             width: lerp(start.width, target.width), height: lerp(start.height, target.height)).integral
+            let clamped = self.lastAnchor.isEmpty ? raw : self.clampRawPanelFrame(raw, in: self.lastAnchor)
+            self.setPanelFrame(clamped)
             if t >= 1 {
                 timer.invalidate()
                 self.setPanelFrame(target)
@@ -2673,26 +3164,39 @@ final class PiPWindowController: PiPInteractionDelegate {
     }
 
     func pipInteractionChanged(_ kind: PiPInteraction, delta: CGVector) {
+        guard let anchor = currentAnchorRect() else {
+            concealPanel()
+            return
+        }
+        lastAnchor = anchor
         let start = interactionStartFrame
         switch kind {
         case .move:
-            setPanelFrame(panelFrame(for: start.offsetBy(dx: delta.dx, dy: delta.dy)))
+            let candidate = start.offsetBy(dx: delta.dx, dy: delta.dy)
+            let clampedPreview = clampPreviewRect(candidate, in: anchor)
+            let clampedPanel = clampRawPanelFrame(panelFrame(for: clampedPreview), in: anchor)
+            setPanelFrame(clampedPanel)
         case .resize(let dragged):
-            // The pinned corner stays put; the size follows the pointer along the axes the dragged corner can move.
             let pinned = corner
+            let out = panelOutsets()
             let outX = dragged.isLeft ? -delta.dx : delta.dx
             let outY = (dragged.isTop ? delta.dy : -delta.dy) / max(aspect, 0.2)
             var candidates: [CGFloat] = []
             if dragged.isLeft != pinned.isLeft { candidates.append(start.width + outX) }
             if dragged.isTop != pinned.isTop { candidates.append(start.width + outY) }
-            let maxWidth = max(Self.minWidth, min(lastAnchor.width - 2 * Self.inset, 1100))
-            let width = round(min(max(candidates.max() ?? start.width, Self.minWidth), maxWidth))
-            let size = CGSize(width: width, height: round(width * aspect))
+            let maxW = max(96, min(anchor.width - 2 * Self.minEdgeInset - out.left - out.right, 1100))
+            let maxH = max(72, anchor.height - 2 * Self.minEdgeInset - out.top - out.bottom)
+            let maxWByHeight = maxH / max(aspect, 0.2)
+            let effectiveMaxW = max(96, min(maxW, maxWByHeight))
+            let minW = min(Self.minWidth, effectiveMaxW)
+            let width = round(min(max(candidates.max() ?? start.width, minW), effectiveMaxW))
+            let size = fittedPreviewSize(for: CGSize(width: width, height: round(width * aspect)), in: anchor)
             let x = pinned.isLeft ? start.minX : start.maxX - size.width
             let y = pinned.isTop ? start.maxY - size.height : start.minY
-            previewSize = size
-            setPanelFrame(panelFrame(for: CGRect(origin: CGPoint(x: x, y: y), size: size)))
-            // PiPs stacked after this one follow the new height live.
+            let clampedPreview = clampPreviewRect(CGRect(origin: CGPoint(x: x, y: y), size: size), in: anchor)
+            previewSize = clampedPreview.size
+            recordNormalizedOrigin(for: clampedPreview, in: anchor)
+            setPanelFrame(clampRawPanelFrame(panelFrame(for: clampedPreview), in: anchor))
             manager?.relayout(animated: false, except: self)
         }
     }
@@ -2720,29 +3224,38 @@ final class PiPWindowController: PiPInteractionDelegate {
     /// Lets clicks through everywhere except over the preview itself (the shadow/blur margin would otherwise
     /// swallow clicks meant for the card peeking out underneath).
     func updateMousePassThrough(at point: NSPoint) {
-        guard let panel, isShowing else { return }
+        guard let panel, isShowing, panel.isVisible else { return }
         if interacting { panel.ignoresMouseEvents = false; return }
-        let hit = currentPreviewFrame().insetBy(dx: -6, dy: -6).contains(point)
+        let hit = isDocked
+            ? panel.frame.contains(point)
+            : currentPreviewFrame().insetBy(dx: -6, dy: -6).contains(point)
         if panel.ignoresMouseEvents == hit { panel.ignoresMouseEvents = !hit }
     }
 
     func pipInteractionEnded(_ kind: PiPInteraction) {
-        let anchor = anchorRect()
+        guard let anchor = currentAnchorRect() else {
+            interacting = false
+            concealPanel()
+            return
+        }
         lastAnchor = anchor
         if case .move = kind {
-            let screen = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
             let frame = currentPreviewFrame()
+            let out = panelOutsets()
+            let leftEdgeThreshold = anchor.minX + Self.minEdgeInset + out.left + 8
+            let rightEdgeThreshold = anchor.maxX - Self.minEdgeInset - out.right - 8
 
-            // Live Edge Docking (Feature 3): if released near or beyond left/right display edge
-            if frame.midX < screen.minX + 80 || frame.minX < screen.minX - 20 {
-                dock(to: .left)
+            // In-window Edge Docking: dock flush inside the host agent window's left/right edge (NEVER outside!)
+            if frame.minX <= leftEdgeThreshold && (NSEvent.mouseLocation.x <= anchor.minX + 24) {
+                dock(to: .left, desiredMidY: frame.midY, in: anchor)
                 return
-            } else if frame.midX > screen.maxX - 80 || frame.maxX > screen.maxX + 20 {
-                dock(to: .right)
+            } else if frame.maxX >= rightEdgeThreshold && (NSEvent.mouseLocation.x >= anchor.maxX - 24) {
+                dock(to: .right, desiredMidY: frame.midY, in: anchor)
                 return
             }
 
-            // Snap to whichever corner of the caller window is closest; join the end of that corner's stack.
+            // Snap to whichever corner of the caller window is closest; clear custom offset so cascade snaps cleanly.
+            customNormalizedOrigin = nil
             let newCorner: PiPCorner
             switch (frame.midX < anchor.midX, frame.midY > anchor.midY) {
             case (true, true): newCorner = .topLeft
@@ -2757,15 +3270,27 @@ final class PiPWindowController: PiPInteractionDelegate {
             }
         }
         manager?.relayout(animated: true, except: self)
-        guard let panel, slotFrame() != panel.frame else {
+        let target = targetContainedPanelFrame(in: anchor)
+        guard let panel, target != panel.frame else {
             interacting = false
             manager?.restackAll()
             return
         }
-        animate(to: slotFrame()) { [weak self] in
+        animate(to: target) { [weak self] in
             self?.interacting = false
             self?.manager?.restackAll()
         }
+    }
+
+    private func recordNormalizedOrigin(for preview: CGRect, in anchor: CGRect) {
+        let out = panelOutsets()
+        let minX = anchor.minX + Self.minEdgeInset + out.left
+        let maxX = anchor.maxX - Self.minEdgeInset - out.right - preview.width
+        let minY = anchor.minY + Self.minEdgeInset + out.bottom
+        let maxY = anchor.maxY - Self.minEdgeInset - out.top - preview.height
+        let nx = (maxX > minX) ? (preview.minX - minX) / (maxX - minX) : (corner.isLeft ? 0 : 1)
+        let ny = (maxY > minY) ? (preview.minY - minY) / (maxY - minY) : (corner.isTop ? 1 : 0)
+        customNormalizedOrigin = CGPoint(x: min(max(nx, 0), 1), y: min(max(ny, 0), 1))
     }
 
     /// Resizes the window and lays out its layers in the same Core Animation commit. Without this the window
@@ -2784,32 +3309,37 @@ final class PiPWindowController: PiPInteractionDelegate {
         CATransaction.flush()
     }
 
-    // MARK: - Live Edge Docking (Feature 3)
+    // MARK: - Live Edge Docking (Strictly In-Window)
 
-    func dock(to side: PiPDockSide) {
+    private func dockedPanelFrame(side: PiPDockSide, in anchor: CGRect) -> CGRect {
+        let tabW = min(Self.dockedTabWidth, max(32, anchor.width * 0.25))
+        let fullSize = fittedPreviewSize(for: previewSize, in: anchor)
+        let tabH = min(max(80, fullSize.height), max(80, anchor.height - Self.minEdgeInset * 2))
+        let minY = anchor.minY + Self.minEdgeInset
+        let maxY = max(minY, anchor.maxY - Self.minEdgeInset - tabH)
+        let y = minY + (maxY - minY) * min(max(dockedNormalizedY, 0), 1)
+        let x = (side == .left) ? anchor.minX : (anchor.maxX - tabW)
+        return clampRawPanelFrame(CGRect(x: x, y: y, width: tabW, height: tabH).integral, in: anchor)
+    }
+
+    func dock(to side: PiPDockSide, desiredMidY: CGFloat? = nil, in explicitAnchor: CGRect? = nil) {
         guard let panel, isShowing else { return }
+        guard let anchor = explicitAnchor ?? currentAnchorRect() else {
+            concealPanel()
+            return
+        }
+        lastAnchor = anchor
         dockSide = side
         preDockFrame = panel.frame
+        let refY = desiredMidY ?? panel.frame.midY
+        let usableH = max(1, anchor.height - Self.minEdgeInset * 2)
+        dockedNormalizedY = min(max((refY - (anchor.minY + Self.minEdgeInset)) / usableH, 0), 1)
         pipView?.setDocked(true, side: side)
 
-        let screen = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
-        let curPreview = currentPreviewFrame()
-        let tabVisibleWidth: CGFloat = 36.0
-
-        let dockedY = min(max(curPreview.minY, screen.minY + 20), screen.maxY - curPreview.height - 20)
-        let targetPreviewX: CGFloat
-        switch side {
-        case .left:
-            targetPreviewX = screen.minX + tabVisibleWidth - curPreview.width
-        case .right:
-            targetPreviewX = screen.maxX - tabVisibleWidth
-        }
-
-        let targetPreview = CGRect(x: targetPreviewX, y: dockedY, width: curPreview.width, height: curPreview.height)
-        let targetPanelFrame = panelFrame(for: targetPreview)
-
+        let targetPanelFrame = dockedPanelFrame(side: side, in: anchor)
         animate(to: targetPanelFrame) { [weak self] in
             self?.interacting = false
+            self?.manager?.restackAll()
         }
     }
 
@@ -2817,8 +3347,13 @@ final class PiPWindowController: PiPInteractionDelegate {
         guard panel != nil, isShowing, isDocked else { return }
         dockSide = nil
         pipView?.setDocked(false, side: nil)
-
-        let targetFrame = preDockFrame ?? slotFrame()
+        guard let anchor = currentAnchorRect() else {
+            interacting = false
+            concealPanel()
+            return
+        }
+        lastAnchor = anchor
+        let targetFrame = clampRawPanelFrame(preDockFrame ?? targetContainedPanelFrame(in: anchor), in: anchor)
         preDockFrame = nil
         animate(to: targetFrame) { [weak self] in
             guard let self = self else { return }
@@ -2954,18 +3489,48 @@ final class PiPWindowController: PiPInteractionDelegate {
         return nil
     }
 
-    /// Frontmost sizeable window of `pid`: its id and frame in Cocoa screen coordinates.
-    static func frontWindow(of pid: pid_t) -> (id: CGWindowID, rect: CGRect)? {
+    /// Queries ONLY on-screen normal-layer windows on the CURRENT active Space for `pid`,
+    /// converts Quartz top-left coordinates to AppKit bottom-left coordinates using primary display [0],
+    /// and clips to the containing monitor's `visibleFrame`.
+    static func frontWindow(of pid: pid_t) -> AnchorWindowInfo? {
+        guard pid > 1 else { return nil }
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return nil }
-        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        let screens = NSScreen.screens
+        guard let primaryScreen = screens.first else { return nil }
+        let primaryMaxY = primaryScreen.frame.maxY
+
         for info in list {
             guard (info[kCGWindowOwnerPID as String] as? pid_t) == pid,
                   (info[kCGWindowLayer as String] as? Int) == 0,
-                  let id = info[kCGWindowNumber as String] as? CGWindowID,
+                  ((info[kCGWindowAlpha as String] as? Double) ?? 1.0) > 0.05,
+                  ((info[kCGWindowIsOnscreen as String] as? Bool) ?? true),
+                  let id = info[kCGWindowNumber as String] as? Int,
                   let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
-                  let bounds = CGRect(dictionaryRepresentation: boundsDict),
-                  bounds.width >= 240, bounds.height >= 180 else { continue }
-            return (id, CGRect(x: bounds.minX, y: primaryHeight - bounds.maxY, width: bounds.width, height: bounds.height))
+                  let cgRect = CGRect(dictionaryRepresentation: boundsDict),
+                  cgRect.width >= PiPManager.minUsableAnchorSize.width,
+                  cgRect.height >= PiPManager.minUsableAnchorSize.height else { continue }
+
+            let appKitRect = CGRect(
+                x: cgRect.origin.x,
+                y: primaryMaxY - cgRect.origin.y - cgRect.height,
+                width: cgRect.width,
+                height: cgRect.height
+            )
+
+            let bestScreen = screens.max { a, b in
+                let ia = appKitRect.intersection(a.frame)
+                let ib = appKitRect.intersection(b.frame)
+                let areaA = ia.isNull ? 0 : ia.width * ia.height
+                let areaB = ib.isNull ? 0 : ib.width * ib.height
+                return areaA < areaB
+            } ?? primaryScreen
+
+            let clamped = appKitRect.intersection(bestScreen.visibleFrame).integral
+            guard !clamped.isNull,
+                  clamped.width >= PiPManager.minUsableAnchorSize.width,
+                  clamped.height >= PiPManager.minUsableAnchorSize.height else { continue }
+
+            return AnchorWindowInfo(windowID: id, rawRect: appKitRect, clampedRect: clamped)
         }
         return nil
     }
@@ -2986,6 +3551,8 @@ class FlippedView: NSView {
 }
 
 class FancyCursorDaemon {
+    static weak var sharedIfInitialized: FancyCursorDaemon?
+
     var panel: NSPanel!
     var rootLayer: CALayer!
     var cursorContainerLayer: CALayer!
@@ -2993,6 +3560,7 @@ class FancyCursorDaemon {
     var idleTimer: Timer?
     var screenHeight: CGFloat = 1329.0
     var pipManager: PiPManager?
+    var activeAnchorPID: pid_t?
     
     // Smooth 60fps movement animation properties
     var animTimer: Timer?
@@ -3018,11 +3586,12 @@ class FancyCursorDaemon {
     
     func start() {
         isCursorDaemonProcess = true
+        Self.sharedIfInitialized = self
         try? "\(ProcessInfo.processInfo.processIdentifier)".write(toFile: kCursorDaemonPIDPath, atomically: true, encoding: .utf8)
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         
-        if let mainScreen = NSScreen.main {
+        if let mainScreen = NSScreen.screens.first ?? NSScreen.main {
             screenHeight = mainScreen.frame.height
         }
         
@@ -3039,9 +3608,9 @@ class FancyCursorDaemon {
         )
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.ignoresMouseEvents = true
-        panel.level = .popUpMenu
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.level = .floating
+        configureContainedOverlayPanel(panel)
+        panel.alphaValue = 0.0
         
         let customView = FlippedView(frame: NSRect(x: 0, y: 0, width: panelSize, height: panelSize))
         customView.wantsLayer = true
@@ -3052,11 +3621,45 @@ class FancyCursorDaemon {
         
         setupActualCursorVisuals()
         registerNotifications()
-        resetIdleTimer()
         
-        panel.orderFrontRegardless()
-        print("Compact Delta Cursor Daemon active (Untouched 19pt asset, Smooth 60fps glide, zero clipping, PiP oversight enabled).")
+        print("Compact Delta Cursor Daemon active (Strict host-app PiP & overlay containment enabled).")
         app.run()
+    }
+
+    func configureContainedOverlayPanel(_ overlayPanel: NSPanel) {
+        Self.sharedIfInitialized = self
+        overlayPanel.ignoresMouseEvents = true
+        overlayPanel.hidesOnDeactivate = false
+        // Remove .canJoinAllSpaces so the desktop cursor overlay NEVER follows onto other Spaces.
+        overlayPanel.collectionBehavior = [.fullScreenAuxiliary, .transient, .ignoresCycle]
+    }
+
+    /// Suppresses desktop-floating cursor whenever:
+    /// 1. The action targets a background window already mirrored in PiP (unless MCU_DESKTOP_CURSOR_OVERLAY=1), OR
+    /// 2. The host agent app is unresolved or not frontmost, OR
+    /// 3. The point lies outside the host agent app's active window bounds.
+    func shouldDisplayDesktopCursor(atAppKitPoint point: CGPoint, anchorPID: pid_t?, hasTargetWindowPiP: Bool) -> Bool {
+        if hasTargetWindowPiP, ProcessInfo.processInfo.environment["MCU_DESKTOP_CURSOR_OVERLAY"] != "1" {
+            return false
+        }
+        guard let pid = anchorPID,
+              let anchor = pipManager?.activeAnchorWindow(for: pid) else {
+            return false
+        }
+        return anchor.clampedRect.contains(point)
+    }
+
+    func enforceContainment() {
+        guard let overlayPanel = self.panel else { return }
+        guard let pid = activeAnchorPID,
+              let anchor = pipManager?.activeAnchorWindow(for: pid),
+              overlayPanel.isOnActiveSpace,
+              anchor.clampedRect.intersects(overlayPanel.frame) else {
+            if overlayPanel.isVisible {
+                overlayPanel.orderOut(nil)
+            }
+            return
+        }
     }
     
     func setupActualCursorVisuals() {
@@ -3114,18 +3717,15 @@ class FancyCursorDaemon {
             guard let self = self,
                   let info = notif.userInfo as? [String: Any],
                   let action = info["action"] as? String else { return }
+
+            if (info["anchorUnresolved"] as? Bool) == true {
+                self.activeAnchorPID = nil
+            } else if let anchorRaw = info["anchorPID"] as? Int, anchorRaw > 1 {
+                self.activeAnchorPID = pid_t(anchorRaw)
+            }
             
             if action != "done" && action != "pip_hide" && action != "auto_pip_end" {
                 self.resetIdleTimer()
-            }
-            
-            // Bring cursor to front if moving or clicking
-            if (action == "move" || action == "click" || action == "show") && self.panel.alphaValue < 1.0 {
-                self.panel.orderFrontRegardless()
-                NSAnimationContext.runAnimationGroup { ctx in
-                    ctx.duration = 0.15
-                    self.panel.animator().alphaValue = 1.0
-                }
             }
             
             switch action {
@@ -3145,9 +3745,10 @@ class FancyCursorDaemon {
             case "auto_pip_begin":
                 let app = info["app"] as? String
                 let wid = (info["windowID"] as? Int).map { CGWindowID($0) }
-                let anchor = (info["anchorPID"] as? Int).map { pid_t($0) }
+                let anchor: pid_t? = ((info["anchorUnresolved"] as? Bool) == true) ? nil : (info["anchorPID"] as? Int).map { pid_t($0) }
                 let inFlight = (info["inFlightTimeout"] as? Double) ?? 15.0
                 self.pipManager?.beginAutoPiP(appName: app, windowID: wid, anchorPID: anchor, inFlightTimeout: inFlight)
+                self.enforceContainment()
             case "auto_pip_end":
                 let wid = (info["windowID"] as? Int).map { CGWindowID($0) }
                 let timeout = (info["timeout"] as? Double) ?? autoPiPTimeoutSeconds()
@@ -3155,8 +3756,9 @@ class FancyCursorDaemon {
             case "pip_show":
                 let app = info["app"] as? String
                 let wid = (info["windowID"] as? Int).map { CGWindowID($0) }
-                let anchor = (info["anchorPID"] as? Int).map { pid_t($0) }
+                let anchor: pid_t? = ((info["anchorUnresolved"] as? Bool) == true) ? nil : (info["anchorPID"] as? Int).map { pid_t($0) }
                 self.pipManager?.show(appName: app, windowID: wid, anchorPID: anchor)
+                self.enforceContainment()
             case "pip_dock":
                 let sideStr = info["side"] as? String ?? "right"
                 let side: PiPDockSide = (sideStr == "left") ? .left : .right
@@ -3187,10 +3789,15 @@ class FancyCursorDaemon {
                 }
                 self.pipManager?.notifyCursorHidden()
             case "show":
-                self.panel.orderFrontRegardless()
-                NSAnimationContext.runAnimationGroup { ctx in
-                    ctx.duration = 0.20
-                    self.panel.animator().alphaValue = 1.0
+                let pt = NSPoint(x: self.panel.frame.midX, y: self.panel.frame.midY)
+                if self.shouldDisplayDesktopCursor(atAppKitPoint: pt, anchorPID: self.activeAnchorPID, hasTargetWindowPiP: self.pipManager?.hasShowingPiP ?? false) {
+                    self.panel.orderFrontRegardless()
+                    NSAnimationContext.runAnimationGroup { ctx in
+                        ctx.duration = 0.20
+                        self.panel.animator().alphaValue = 1.0
+                    }
+                } else {
+                    self.panel.orderOut(nil)
                 }
             case "stop":
                 self.pipManager?.hideAll()
@@ -3203,15 +3810,33 @@ class FancyCursorDaemon {
     }
     
     func moveTo(x: CGFloat, y: CGFloat, smooth: Bool = true, speed: String? = nil, duration: Double? = nil) {
-        if let mainScreen = NSScreen.main {
-            screenHeight = mainScreen.frame.height
+        if let primaryScreen = NSScreen.screens.first ?? NSScreen.main {
+            screenHeight = primaryScreen.frame.height
         }
+        let appKitTip = CGPoint(x: x, y: screenHeight - y)
         let panelOriginX = x - tipOffsetX
         let panelOriginY = screenHeight - y - panelSize + tipOffsetY
         let target = NSPoint(x: panelOriginX, y: panelOriginY)
         
         animTimer?.invalidate()
         animTimer = nil
+
+        let showDesktopCursor = shouldDisplayDesktopCursor(
+            atAppKitPoint: appKitTip,
+            anchorPID: activeAnchorPID,
+            hasTargetWindowPiP: pipManager?.hasShowingPiP ?? false
+        )
+        if !showDesktopCursor {
+            if panel.isVisible { panel.orderOut(nil) }
+            panel.setFrameOrigin(target)
+            let dur = duration ?? (smooth ? 0.35 : 0.03)
+            pipManager?.notifyCursorMoved(to: CGPoint(x: x, y: y), duration: dur)
+            return
+        }
+        if !panel.isVisible || panel.alphaValue < 1.0 {
+            panel.orderFrontRegardless()
+            panel.alphaValue = 1.0
+        }
         
         if !smooth {
             panel.setFrameOrigin(target)
@@ -3344,11 +3969,6 @@ class FancyCursorDaemon {
                 self.panel.orderOut(nil)
             })
             self.pipManager?.notifyCursorHidden()
-        }
-        
-        if panel.alphaValue < 1.0 {
-            panel.orderFrontRegardless()
-            panel.alphaValue = 1.0
         }
     }
 }
@@ -4261,6 +4881,9 @@ func clickMouseNonDisruptive(
                     postTargeted(upType, clickState: Int64(i))
                     if i < clickCount { usleep(120000) }
                 }
+                if hidMode == .disabled && (axHitRole == nil || axHitRole == "AXWindow" || isChromiumOrCEFProcess(pid: resolvedPID)) {
+                    deliveryMode = "Zero-focus background delivery; if this CEF/no-AX control did not respond, retry with hid=true and hid_reason"
+                }
             }
         }
 
@@ -5063,6 +5686,514 @@ func clickText(
 
 // MARK: - Native MCP Server (stdio JSON-RPC 2.0)
 
+/// Per-session MCP state enforcing non-disruptive rules and self-correcting guidance at runtime,
+/// guaranteeing every MCP client follows background-only, zero-disturbance rules without manual skill files.
+final class MCPSessionGuard {
+    static let shared = MCPSessionGuard()
+
+    private let lock = NSLock()
+    private var emittedContractBanner = false
+    private var backgroundAttemptedTargets = Set<String>()
+    private var lastMove: (targetKey: String, x: Double, y: Double, time: TimeInterval)?
+
+    static let contractBanner = """
+    [mcu Non-Disruptive Rules]
+    - NEVER run `open -a` or AppleScript `activate` (use `browser_open` for URLs; all `mcu` tools work on unfocused/covered windows).
+    - ALWAYS pass `app` or `window` from `window_list`; NEVER capture the full screen (`ocr` and `window_capture` read background windows directly).
+    - NEVER call `move` before `click`/`click_text`, and keep `hid: false` so the user's real mouse and active window stay untouched. Call `done` when finished.
+    """
+
+    static let supportedProtocolVersions: [String] = [
+        "2025-06-18",
+        "2025-03-26",
+        "2024-11-05"
+    ]
+
+    static func negotiateProtocolVersion(clientRequested: String?) -> String {
+        guard let req = clientRequested, supportedProtocolVersions.contains(req) else {
+            return "2024-11-05"
+        }
+        return req
+    }
+
+    func targetKey(app: String?, window: Int?, systemUI: Bool = false) -> String {
+        if let window { return "win:\(window)" }
+        if let app = app?.trimmingCharacters(in: .whitespacesAndNewlines), !app.isEmpty {
+            return "app:\(app.lowercased())"
+        }
+        return systemUI ? "system_ui" : "unscoped"
+    }
+
+    /// Validates that window-targeted tools specify `app` or `window` (or explicit `system_ui` + `system_ui_reason`).
+    func validateTargetScope(
+        tool: String,
+        args: [String: Any],
+        allowSystemUIEscape: Bool
+    ) -> String? {
+        let app = (args["app"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasApp = app != nil && !(app!.isEmpty)
+        let hasWindow = (args["window"] as? NSNumber) != nil || (args["wid"] as? NSNumber) != nil
+
+        if hasApp || hasWindow { return nil }
+
+        if allowSystemUIEscape, (args["system_ui"] as? Bool) == true {
+            let reason = (args["system_ui_reason"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if reason.count >= 6 {
+                return nil
+            }
+            return """
+            Refused `\(tool)`: `system_ui: true` requires a concrete `system_ui_reason` (at least 6 chars) naming the windowless OS element (e.g. "Spotlight search bar" or "macOS TCC permission dialog"). For normal app windows, pass `app` or `window` from `window_list`.
+            """
+        }
+
+        let escapeNote = allowSystemUIEscape
+            ? " Only if interacting with windowless macOS system UI (menu bar extra, Spotlight, OS alert absent from `window_list`), pass `system_ui: true` and `system_ui_reason`."
+            : ""
+        return """
+        Refused `\(tool)` without `app` or `window`: unscoped actions touch the user's foreground workspace.
+        Fix:
+        1. Call `window_list` to get the target `app` name or `window` ID (works on unfocused/covered windows—do NOT run `open -a` or activate the app).
+        2. Re-call `\(tool)` with `app` or `window`.\(escapeNote)
+        """
+    }
+
+    /// Blocks full-screen `screen_capture` unless explicitly justified for windowless system UI.
+    func validateScreenCapture(args: [String: Any]) -> String? {
+        let app = (args["app"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasApp = app != nil && !(app!.isEmpty)
+        let hasWindow = (args["window"] as? NSNumber) != nil || (args["wid"] as? NSNumber) != nil
+        let rect = (args["rect"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasRect = rect != nil && !(rect!.isEmpty)
+
+        if hasApp || hasWindow || hasRect { return nil }
+
+        let allowFull = (args["allow_fullscreen"] as? Bool) == true
+        let reason = (args["fullscreen_reason"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if allowFull && reason.count >= 8 {
+            return nil
+        }
+
+        return """
+        Refused unscoped full-screen `screen_capture`: capturing the entire desktop exposes and disrupts the user's workspace.
+        Fix:
+        - For text/buttons/menus: call `ocr` with `app` or `window`.
+        - For visual layout of an app: call `window_capture` with `app` or `window` (captures background/covered windows cleanly without focusing them).
+        - Only for windowless macOS system UI missing from `window_list` (menu bar, Spotlight, OS dialog): pass `rect` ("x,y,w,h") OR set `allow_fullscreen: true` with `fullscreen_reason`.
+        """
+    }
+
+    /// Blocks `hid: true` unless non-HID background click was already attempted on the same target in this session AND `hid_reason` is given.
+    func validateAndRecordClick(
+        tool: String,
+        args: [String: Any],
+        x: Double?,
+        y: Double?
+    ) -> (rejectionError: String?, postClickWarning: String?) {
+        let app = args["app"] as? String
+        let window = (args["window"] as? NSNumber)?.intValue
+        let systemUI = (args["system_ui"] as? Bool) == true
+        let key = targetKey(app: app, window: window, systemUI: systemUI)
+        let useHID = (args["hid"] as? Bool) == true
+
+        lock.lock()
+        defer { lock.unlock() }
+
+        if useHID {
+            let reason = (args["hid_reason"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard backgroundAttemptedTargets.contains(key) else {
+                return (
+                    """
+                    Refused `\(tool)` with `hid: true`: HID mode moves the user's physical mouse cursor and temporarily activates the target window.
+                    Fix: Call `\(tool)` with `hid: false` (default) on `\(key)` FIRST. Only if that background click has no effect, retry with `hid: true` and explain what failed in `hid_reason`.
+                    """,
+                    nil
+                )
+            }
+            guard reason.count >= 6 else {
+                return (
+                    """
+                    Refused `\(tool)` with `hid: true`: provide `hid_reason` explaining which `hid: false` click on `\(key)` failed to register.
+                    """,
+                    nil
+                )
+            }
+        } else {
+            backgroundAttemptedTargets.insert(key)
+        }
+
+        var moveWarning: String? = nil
+        if let prev = lastMove,
+           Date().timeIntervalSince1970 - prev.time < 6.0,
+           prev.targetKey == key {
+            if let x, let y, hypot(prev.x - x, prev.y - y) < 4.0 {
+                moveWarning = "Note: omit `move` before `click` next time—`click` animates the virtual cursor automatically."
+            } else if tool == "click_text" {
+                moveWarning = "Note: omit `move` before `click_text` next time—`click_text` moves the virtual cursor automatically."
+            }
+            lastMove = nil
+        }
+
+        return (nil, moveWarning)
+    }
+
+    func recordMove(app: String?, window: Int?, systemUI: Bool, x: Double, y: Double) {
+        let key = targetKey(app: app, window: window, systemUI: systemUI)
+        lock.lock()
+        lastMove = (key, x, y, Date().timeIntervalSince1970)
+        lock.unlock()
+    }
+
+    func attachBannerIfNeeded(to text: String, forceForWindowList: Bool = false) -> String {
+        lock.lock()
+        let shouldPrepend = !emittedContractBanner || forceForWindowList
+        emittedContractBanner = true
+        lock.unlock()
+        guard shouldPrepend else { return text }
+        return "\(Self.contractBanner)\n\n\(text)"
+    }
+}
+
+private func mcpTargetScopeProperties(includeSystemUIEscape: Bool = true) -> [String: Any] {
+    var props: [String: Any] = [
+        "app": [
+            "type": "string",
+            "description": "Target application name from `window_list` (e.g. 'Safari'). REQUIRED unless `window` is set. Operates in background—NEVER activate or `open -a` the app."
+        ],
+        "window": [
+            "type": "integer",
+            "description": "Target CGWindowID from `window_list`. REQUIRED unless `app` is set. Operates in background without stealing focus."
+        ]
+    ]
+    if includeSystemUIEscape {
+        props["system_ui"] = [
+            "type": "boolean",
+            "description": "Set true ONLY for windowless macOS system UI absent from `window_list` (Spotlight, menu bar extra, OS alert). Requires `system_ui_reason`."
+        ]
+        props["system_ui_reason"] = [
+            "type": "string",
+            "description": "Required when `system_ui: true`: identify the windowless OS UI element."
+        ]
+    }
+    return props
+}
+
+private func mcpAnnotations(
+    readOnly: Bool,
+    destructive: Bool = false,
+    idempotent: Bool = false,
+    openWorld: Bool = false
+) -> [String: Any] {
+    [
+        "readOnlyHint": readOnly,
+        "destructiveHint": destructive,
+        "idempotentHint": idempotent,
+        "openWorldHint": openWorld
+    ]
+}
+
+private let mcpServerInstructions = """
+STRICT NON-DISRUPTIVE CONTRACT FOR macos-computer-use (mcu):
+1. NEVER FOCUS OR ACTIVATE APPS: Never run `open -a`, `osascript -e 'tell application ... to activate'`, or click the Dock. All `mcu` tools inspect and control unfocused/occluded windows in the background. To open a URL, call `browser_open` (opens in background without stealing focus).
+2. ALWAYS SCOPE BY `app` OR `window`: Start with `window_list`, then pass `app` or `window` on every `ocr`, `click_text`, `click`, `type`, `key`, `hotkey`, `scroll`, `select_range`, and `window_capture` call.
+3. NEVER CAPTURE FULL SCREEN: Use `ocr(app:...)` for text/UI discovery and `window_capture(app:...)` for visual layout (works even when the target window is behind other windows). Full-screen `screen_capture` is blocked unless inspecting windowless OS UI.
+4. NEVER TOUCH REAL MOUSE OR CALL `move` BEFORE `click`: Keep `hid: false` (default virtual background delivery). `click` and `click_text` animate the virtual cursor inside the PiP preview automatically—use `move` strictly for hover-only tooltips.
+5. CLEAN UP: Pass `done: true` on your final action or call `done` when finished to dismiss PiP immediately.
+"""
+
+private func buildMCPToolsList() -> [[String: Any]] {
+    func merge(_ a: [String: Any], _ b: [String: Any]) -> [String: Any] {
+        var out = a
+        for (k, v) in b { out[k] = v }
+        return out
+    }
+
+    return [
+        [
+            "name": "window_list",
+            "description": "[START HERE — BACKGROUND CONTROL] List all open app windows (including unfocused/covered windows) with `app` name, `window` ID, title, and bounds. NEVER run `open -a` or AppleScript `activate`—pass the returned `app` or `window` to other `mcu` tools to work silently in the background.",
+            "annotations": mcpAnnotations(readOnly: true, idempotent: true),
+            "inputSchema": ["type": "object", "properties": [:] as [String: Any]]
+        ],
+        [
+            "name": "ocr",
+            "description": "[PREFERRED INSPECTION] Extract visible text + clickable coordinates from ONE target `app` or `window` (and its open popup menus) in the background without focusing it or capturing the user's screen. Requires `app` or `window`.",
+            "annotations": mcpAnnotations(readOnly: true, idempotent: true),
+            "inputSchema": [
+                "type": "object",
+                "properties": merge(mcpTargetScopeProperties(), [
+                    "fast": ["type": "boolean", "description": "Use fast recognition mode (default: true).", "default": true]
+                ])
+            ]
+        ],
+        [
+            "name": "click_text",
+            "description": "Find visible text via OCR inside target `app` or `window` and click it in the background (virtual cursor in PiP; never moves real mouse or steals focus). Do NOT call `move` beforehand. Requires `app` or `window`.",
+            "annotations": mcpAnnotations(readOnly: false),
+            "inputSchema": [
+                "type": "object",
+                "required": ["query"],
+                "properties": merge(mcpTargetScopeProperties(), [
+                    "query": ["type": "string", "description": "Text label to match and click."],
+                    "button": ["type": "string", "enum": ["left", "right", "middle"], "default": "left"],
+                    "count": ["type": "integer", "default": 1],
+                    "hid": ["type": "boolean", "description": "LEAVE FALSE (default). Setting true moves the physical mouse + window focus; blocked unless `hid: false` already failed on this target AND `hid_reason` is set.", "default": false],
+                    "hid_reason": ["type": "string", "description": "Required if `hid: true`: state which prior `hid: false` click on this target had no effect."],
+                    "done": ["type": "boolean", "description": "Set true if this is the final step to close PiP immediately.", "default": false]
+                ])
+            ]
+        ],
+        [
+            "name": "click",
+            "description": "Click coordinates in target `app` or `window` in the background without moving the hardware mouse or focusing the app. Animates virtual cursor inside PiP automatically—NEVER call `move` before `click`. Requires `app` or `window`.",
+            "annotations": mcpAnnotations(readOnly: false),
+            "inputSchema": [
+                "type": "object",
+                "required": ["x", "y"],
+                "properties": merge(mcpTargetScopeProperties(), [
+                    "x": ["type": "number", "description": "X coordinate in screen points from `ocr` or `window_capture`."],
+                    "y": ["type": "number", "description": "Y coordinate in screen points from `ocr` or `window_capture`."],
+                    "button": ["type": "string", "enum": ["left", "right", "middle"], "default": "left"],
+                    "count": ["type": "integer", "default": 1],
+                    "hid": ["type": "boolean", "description": "LEAVE FALSE (default). Setting true moves the physical mouse + window focus; blocked unless `hid: false` already failed on this target AND `hid_reason` is set.", "default": false],
+                    "hid_reason": ["type": "string", "description": "Required if `hid: true`: state which prior `hid: false` click on this target had no effect."],
+                    "done": ["type": "boolean", "description": "Set true if this is the final step to close PiP immediately.", "default": false]
+                ])
+            ]
+        ],
+        [
+            "name": "type",
+            "description": "Send text input directly to target `app` or `window` in the background without activating it. Requires `app` or `window`.",
+            "annotations": mcpAnnotations(readOnly: false),
+            "inputSchema": [
+                "type": "object",
+                "required": ["text"],
+                "properties": merge(mcpTargetScopeProperties(), [
+                    "text": ["type": "string", "description": "Text to type."],
+                    "done": ["type": "boolean", "default": false]
+                ])
+            ]
+        ],
+        [
+            "name": "key",
+            "description": "Send a key press (e.g. 'return', 'escape', 'tab', 'down') directly to target `app` or `window` in the background without activating it. Requires `app` or `window`.",
+            "annotations": mcpAnnotations(readOnly: false),
+            "inputSchema": [
+                "type": "object",
+                "required": ["name"],
+                "properties": merge(mcpTargetScopeProperties(), [
+                    "name": ["type": "string", "description": "Key name (e.g. 'return', 'tab', 'escape', 'space', 'up', 'down')."],
+                    "done": ["type": "boolean", "default": false]
+                ])
+            ]
+        ],
+        [
+            "name": "hotkey",
+            "description": "Send a keyboard shortcut (e.g. 'cmd+l', 'cmd+w') directly to target `app` or `window` in the background without activating it. Requires `app` or `window`.",
+            "annotations": mcpAnnotations(readOnly: false),
+            "inputSchema": [
+                "type": "object",
+                "required": ["combo"],
+                "properties": merge(mcpTargetScopeProperties(), [
+                    "combo": ["type": "string", "description": "Shortcut combo such as 'cmd+k' or 'cmd+shift+n'."],
+                    "done": ["type": "boolean", "default": false]
+                ])
+            ]
+        ],
+        [
+            "name": "scroll",
+            "description": "Scroll inside target `app` or `window` in the background without moving the real cursor or focusing the app. Requires `app` or `window`.",
+            "annotations": mcpAnnotations(readOnly: false),
+            "inputSchema": [
+                "type": "object",
+                "required": ["dy"],
+                "properties": merge(mcpTargetScopeProperties(), [
+                    "dy": ["type": "integer", "description": "Vertical scroll delta (positive = up, negative = down)."],
+                    "dx": ["type": "integer", "description": "Horizontal scroll delta.", "default": 0],
+                    "x": ["type": "number", "description": "Optional X position inside window."],
+                    "y": ["type": "number", "description": "Optional Y position inside window."],
+                    "done": ["type": "boolean", "default": false]
+                ])
+            ]
+        ],
+        [
+            "name": "select_range",
+            "description": "Drag-select between two coordinates inside target `app` or `window` in the background without moving the real mouse. Requires `app` or `window`.",
+            "annotations": mcpAnnotations(readOnly: false),
+            "inputSchema": [
+                "type": "object",
+                "required": ["from_x", "from_y", "to_x", "to_y"],
+                "properties": merge(mcpTargetScopeProperties(), [
+                    "from_x": ["type": "number", "description": "Start X coordinate."],
+                    "from_y": ["type": "number", "description": "Start Y coordinate."],
+                    "to_x": ["type": "number", "description": "End X coordinate."],
+                    "to_y": ["type": "number", "description": "End Y coordinate."],
+                    "done": ["type": "boolean", "default": false]
+                ])
+            ]
+        ],
+        [
+            "name": "window_capture",
+            "description": "[PREFERRED SCREENSHOT] Capture an isolated image of ONE target `app` or `window` in the background (works even when occluded behind other windows; never captures the user's desktop). Prefer `ocr` unless inspecting visual layout. Requires `app` or `window`.",
+            "annotations": mcpAnnotations(readOnly: true, idempotent: true),
+            "inputSchema": [
+                "type": "object",
+                "properties": merge(mcpTargetScopeProperties(includeSystemUIEscape: false), [
+                    "output": ["type": "string", "description": "Output image file path (default: /tmp/mcu_window_<wid>.png)."],
+                    "scale_1x": ["type": "boolean", "description": "Scale Retina capture to 1x logical points (default: true).", "default": true]
+                ])
+            ]
+        ],
+        [
+            "name": "browser_open",
+            "description": "Open a URL in a browser IN THE BACKGROUND without activating the browser or stealing focus. Always use this instead of bash `open <url>` or `open -a`.",
+            "annotations": mcpAnnotations(readOnly: false, openWorld: true),
+            "inputSchema": [
+                "type": "object",
+                "required": ["url"],
+                "properties": [
+                    "url": ["type": "string", "description": "HTTP/HTTPS URL to open in background."],
+                    "app": ["type": "string", "description": "Browser name (default 'Safari').", "default": "Safari"],
+                    "private": ["type": "boolean", "description": "Open in Private/Incognito mode (default false).", "default": false]
+                ]
+            ]
+        ],
+        [
+            "name": "pip_show",
+            "description": "Show in-agent PiP preview for a target `app` or `window` (contained strictly inside the host agent app; hidden whenever another app is active). Requires `app` or `window`.",
+            "annotations": mcpAnnotations(readOnly: true, idempotent: true),
+            "inputSchema": [
+                "type": "object",
+                "properties": mcpTargetScopeProperties(includeSystemUIEscape: false)
+            ]
+        ],
+        [
+            "name": "pip_hide",
+            "description": "Close all active PiP live previews.",
+            "annotations": mcpAnnotations(readOnly: false, idempotent: true),
+            "inputSchema": ["type": "object", "properties": [:] as [String: Any]]
+        ],
+        [
+            "name": "done",
+            "description": "Dismiss all PiP previews and virtual cursor state immediately once your task is complete.",
+            "annotations": mcpAnnotations(readOnly: false, idempotent: true),
+            "inputSchema": ["type": "object", "properties": [:] as [String: Any]]
+        ],
+        [
+            "name": "move",
+            "description": "[HOVER ONLY — DO NOT CALL BEFORE click] Hover the virtual cursor to trigger a tooltip or hover menu inside target `app` or `window`. NEVER call `move` before `click` or `click_text` (`click` moves the cursor automatically). Requires `app` or `window`.",
+            "annotations": mcpAnnotations(readOnly: false),
+            "inputSchema": [
+                "type": "object",
+                "required": ["x", "y"],
+                "properties": merge(mcpTargetScopeProperties(), [
+                    "x": ["type": "number", "description": "Hover X coordinate."],
+                    "y": ["type": "number", "description": "Hover Y coordinate."]
+                ])
+            ]
+        ],
+        [
+            "name": "screen_capture",
+            "description": "[RESTRICTED FALLBACK] Capture a bounded screen `rect` or windowless macOS system UI (menu bar, Spotlight, OS dialog absent from `window_list`). BLOCKED for full-screen desktop capture unless `allow_fullscreen: true` AND `fullscreen_reason` are set. For all apps, use `ocr` or `window_capture` with `app`/`window` instead.",
+            "annotations": mcpAnnotations(readOnly: true, idempotent: true),
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "app": ["type": "string", "description": "Prefer `window_capture` with `app` instead."],
+                    "window": ["type": "integer", "description": "Prefer `window_capture` with `window` instead."],
+                    "rect": ["type": "string", "description": "Bounded region 'x,y,width,height' for menu bar / system UI."],
+                    "output": ["type": "string", "default": "/tmp/mcu_screen.png"],
+                    "allow_fullscreen": ["type": "boolean", "description": "Emergency override for windowless OS UI only; requires `fullscreen_reason`."],
+                    "fullscreen_reason": ["type": "string", "description": "Required with `allow_fullscreen: true`: explain why `window_capture` and `rect` cannot capture the target OS UI."]
+                ]
+            ]
+        ]
+    ]
+}
+
+private func openURLInBackground(urlString: String, appName: String, privateBrowsing: Bool) -> (text: String, isError: Bool) {
+    guard let url = URL(string: urlString) else {
+        return ("Error: Invalid URL '\(urlString)'", true)
+    }
+
+    let config = NSWorkspace.OpenConfiguration()
+    config.activates = false
+    config.addsToRecentItems = false
+
+    let appURL: URL? = {
+        if let running = findRunningApplication(matching: appName)?.bundleURL {
+            return running
+        }
+        let lower = appName.lowercased()
+        let knownBundles: [(String, String)] = [
+            ("safari", "com.apple.Safari"),
+            ("chrome", "com.google.Chrome"),
+            ("brave", "com.brave.Browser"),
+            ("edge", "com.microsoft.edgemac"),
+            ("firefox", "org.mozilla.firefox"),
+            ("arc", "company.thebrowser.Browser")
+        ]
+        for (key, bid) in knownBundles where lower.contains(key) {
+            if let u = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bid) { return u }
+        }
+        let direct = URL(fileURLWithPath: "/Applications/\(appName).app")
+        return FileManager.default.fileExists(atPath: direct.path) ? direct : nil
+    }()
+
+    let semaphore = DispatchSemaphore(value: 0)
+    var openError: Error?
+
+    if let appURL {
+        let lower = appName.lowercased()
+        if privateBrowsing && (lower.contains("chrome") || lower.contains("brave") || lower.contains("edge")) {
+            config.arguments = ["--incognito", url.absoluteString]
+            NSWorkspace.shared.openApplication(at: appURL, configuration: config) { _, err in
+                openError = err
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 5)
+        } else if privateBrowsing && lower.contains("safari") {
+            if findRunningApplication(matching: appName) == nil {
+                NSWorkspace.shared.openApplication(at: appURL, configuration: config) { _, err in
+                    openError = err
+                    semaphore.signal()
+                }
+                _ = semaphore.wait(timeout: .now() + 5)
+                usleep(800_000)
+            }
+            if let match = findRunningApplication(matching: appName) {
+                triggerHotkeyCombo("cmd+shift+n", targetPID: match.processIdentifier)
+                usleep(600_000)
+            }
+            let escaped = urlString.replacingOccurrences(of: "\"", with: "\\\"")
+            let script = "tell application \"Safari\" to set URL of current tab of front window to \"\(escaped)\""
+            var errDict: NSDictionary?
+            NSAppleScript(source: script)?.executeAndReturnError(&errDict)
+        } else {
+            NSWorkspace.shared.open([url], withApplicationAt: appURL, configuration: config) { _, err in
+                openError = err
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 5)
+        }
+    } else {
+        NSWorkspace.shared.open(url, configuration: config) { _, err in
+            openError = err
+            semaphore.signal()
+        }
+        _ = semaphore.wait(timeout: .now() + 5)
+    }
+
+    if let openError {
+        return ("Error opening \(urlString) in \(appName): \(openError.localizedDescription)", true)
+    }
+
+    let wid = PiPWindowController.firstWindowID(matchingApp: appName)
+    if HostAgentResolver.shared.resolveHostAppPID() != nil {
+        VirtualCursorClient.pipShow(appName: appName, windowID: wid.map(Int.init))
+    }
+    return ("Opened \(urlString) in \(appName) \(privateBrowsing ? "(Private/Incognito) " : "")[Background; focus preserved]", false)
+}
+
 func sendMCPResponse(_ dict: [String: Any]) {
     if let data = try? JSONSerialization.data(withJSONObject: dict),
        let str = String(data: data, encoding: .utf8) {
@@ -5071,6 +6202,72 @@ func sendMCPResponse(_ dict: [String: Any]) {
 }
 
 func handleMCPToolCall(name: String, args: [String: Any]) -> (text: String, isError: Bool) {
+    let guardSession = MCPSessionGuard.shared
+    var postExecutionNote: String? = nil
+
+    switch name {
+    case "window_capture", "pip_show":
+        if let err = guardSession.validateTargetScope(tool: name, args: args, allowSystemUIEscape: false) {
+            return (err, true)
+        }
+
+    case "ocr", "type", "keyboard_type", "key", "keyboard_key", "hotkey", "keyboard_hotkey", "scroll", "mouse_scroll", "select_range":
+        if let err = guardSession.validateTargetScope(tool: name, args: args, allowSystemUIEscape: true) {
+            return (err, true)
+        }
+
+    case "click", "mouse_click", "click_text":
+        if let err = guardSession.validateTargetScope(tool: name, args: args, allowSystemUIEscape: true) {
+            return (err, true)
+        }
+        let x = (args["x"] as? NSNumber)?.doubleValue
+        let y = (args["y"] as? NSNumber)?.doubleValue
+        let check = guardSession.validateAndRecordClick(tool: name, args: args, x: x, y: y)
+        if let err = check.rejectionError {
+            return (err, true)
+        }
+        postExecutionNote = check.postClickWarning
+
+    case "move", "mouse_move":
+        if let err = guardSession.validateTargetScope(tool: name, args: args, allowSystemUIEscape: true) {
+            return (err, true)
+        }
+        let x = (args["x"] as? NSNumber)?.doubleValue ?? 0
+        let y = (args["y"] as? NSNumber)?.doubleValue ?? 0
+        let win = (args["window"] as? NSNumber)?.intValue
+        guardSession.recordMove(
+            app: args["app"] as? String,
+            window: win,
+            systemUI: (args["system_ui"] as? Bool) == true,
+            x: x,
+            y: y
+        )
+        postExecutionNote = "Hover complete. Reminder: NEVER call `move` before `click` or `click_text`—they move the virtual cursor automatically."
+
+    case "screen_capture":
+        if let err = guardSession.validateScreenCapture(args: args) {
+            return (err, true)
+        }
+        if args["app"] != nil || args["window"] != nil || args["wid"] != nil {
+            postExecutionNote = "Tip: prefer `window_capture` or `ocr` with `app`/`window`—it captures background windows even when occluded."
+        }
+
+    default:
+        break
+    }
+
+    let raw = executeMCPToolCall(name: name, args: args)
+    var finalText = raw.text
+    if !raw.isError {
+        finalText = guardSession.attachBannerIfNeeded(to: finalText, forceForWindowList: name == "window_list")
+    }
+    if let note = postExecutionNote, !note.isEmpty {
+        finalText += "\n\n\(note)"
+    }
+    return (finalText, raw.isError)
+}
+
+private func executeMCPToolCall(name: String, args: [String: Any]) -> (text: String, isError: Bool) {
     switch name {
     case "click", "mouse_click":
         guard let x = (args["x"] as? NSNumber)?.doubleValue,
@@ -5082,8 +6279,9 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> (text: String, isEr
         let count = (args["count"] as? NSNumber)?.intValue ?? 1
         let app = args["app"] as? String
         let wid = (args["window"] as? NSNumber).map { CGWindowID($0.intValue) }
-        let hidArg = (args["hid"] as? Bool)
-        let hidMode: HIDFallbackMode = (hidArg == true) ? .force : ((hidArg == false) ? .disabled : .auto)
+        // In MCP mode, default to strict zero-disruption background delivery (.disabled);
+        // only use HID when explicitly requested with hid=true after a non-HID attempt failed.
+        let hidMode: HIDFallbackMode = ((args["hid"] as? Bool) == true) ? .force : .disabled
         let resolved = resolveExplicitTarget(appName: app, windowID: wid)
         if let err = resolved.error {
             return (err, true)
@@ -5179,32 +6377,7 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> (text: String, isEr
         guard let url = args["url"] as? String else { return ("Error: missing 'url'", true) }
         let appName = args["app"] as? String ?? "Safari"
         let isPrivate = (args["private"] as? Bool) ?? (args["incognito"] as? Bool) ?? false
-
-        if findRunningApplication(matching: appName) == nil {
-            let config = NSWorkspace.OpenConfiguration()
-            config.activates = false
-            if let bundleID = appName.localizedCaseInsensitiveContains("Safari") ? "com.apple.Safari" : nil,
-               let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-                NSWorkspace.shared.openApplication(at: appURL, configuration: config, completionHandler: nil)
-                sleep(2)
-            }
-        }
-
-        if isPrivate, let match = findRunningApplication(matching: appName) {
-            triggerHotkeyCombo("cmd+shift+n", targetPID: match.processIdentifier)
-            usleep(600000)
-        }
-
-        if appName.localizedCaseInsensitiveContains("Safari") {
-            let script = "tell application \"Safari\" to set URL of current tab of front window to \"\(url)\""
-            var error: NSDictionary?
-            if let appleScript = NSAppleScript(source: script) {
-                appleScript.executeAndReturnError(&error)
-            }
-        }
-        let wid = PiPWindowController.firstWindowID(matchingApp: appName)
-        VirtualCursorClient.pipShow(appName: appName, windowID: wid.map(Int.init))
-        return ("Opened \(url) in \(appName) \(isPrivate ? "(Private Browsing) " : "")[Zero focus stolen, PiP oversight active]", false)
+        return openURLInBackground(urlString: url, appName: appName, privateBrowsing: isPrivate)
 
     case "screen_capture":
         let output = args["output"] as? String ?? "/tmp/mcu_screen.png"
@@ -5262,6 +6435,9 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> (text: String, isEr
             if resolvedWID == nil {
                 return ("Error: No target window specified or found under cursor.", true)
             }
+        }
+        guard HostAgentResolver.shared.resolveHostAppPID() != nil else {
+            return ("PiP preview suppressed: could not anchor to a running GUI host agent app (set MCU_ANCHOR_PID to override).", false)
         }
         try? FileManager.default.removeItem(atPath: kPiPLastErrorPath)
         if let rw = resolvedWID {
@@ -5339,8 +6515,7 @@ func handleMCPToolCall(name: String, args: [String: Any]) -> (text: String, isEr
         let btn: CGMouseButton = (btnStr == "right") ? .right : ((btnStr == "middle" || btnStr == "center") ? .center : .left)
         let count = (args["count"] as? NSNumber)?.intValue ?? 1
         let done = (args["done"] as? Bool) ?? false
-        let hidArg = (args["hid"] as? Bool)
-        let hidMode: HIDFallbackMode = (hidArg == true) ? .force : ((hidArg == false) ? .disabled : .auto)
+        let hidMode: HIDFallbackMode = ((args["hid"] as? Bool) == true) ? .force : .disabled
 
         let result = clickText(query: query, appName: app, windowID: wid, button: btn, clickCount: count, autoClean: done, hidMode: hidMode)
         return (result.message, !result.success)
@@ -5404,27 +6579,26 @@ func runMCPServer() {
 
         switch method {
         case "initialize":
-            let mcpInstructions = """
-            Best practices for macos-computer-use:
-            1. Start by locating the target with `window_list` and/or `ocr` (or `pip_show` for visual oversight). Prefer `ocr` or `click_text` over saving and reading raw PNGs unless inspecting visual layout.
-            2. Pass `app` or `window` explicitly on every action (`click`, `click_text`, `type`, `key`, `hotkey`, `scroll`).
-            3. `click`, `click_text`, `move`, `type`, `key`, `hotkey`, and `scroll` automatically open/extend the floating PiP preview (10s idle timeout) and animate the virtual cursor—do NOT call `move` before `click` or run `open -a` manually.
-            4. When interacting with dropdowns/menus, pass `app` or `window`; `ocr` and `click_text` scan open popup menu layers automatically.
-            5. Call `done` when finished to dismiss PiP and the virtual cursor overlay immediately.
-            """
+            let params = json["params"] as? [String: Any]
+            let requestedVersion = params?["protocolVersion"] as? String
+            if let clientInfo = params?["clientInfo"] as? [String: Any],
+               let clientName = clientInfo["name"] as? String {
+                HostAgentResolver.shared.recordMCPClient(name: clientName)
+            }
+            let negotiatedVersion = MCPSessionGuard.negotiateProtocolVersion(clientRequested: requestedVersion)
             let resp: [String: Any] = [
                 "jsonrpc": "2.0",
                 "id": id ?? 1,
                 "result": [
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": negotiatedVersion,
                     "capabilities": [
-                        "tools": [:]
+                        "tools": ["listChanged": false]
                     ],
                     "serverInfo": [
                         "name": "macos-computer-use",
-                        "version": "1.0.0"
+                        "version": "1.1.0"
                     ],
-                    "instructions": mcpInstructions
+                    "instructions": mcpServerInstructions
                 ]
             ]
             sendMCPResponse(resp)
@@ -5443,215 +6617,11 @@ func runMCPServer() {
             }
 
         case "tools/list":
-            let tools: [[String: Any]] = [
-                [
-                    "name": "click",
-                    "description": "Click or double-click at coordinates using virtual cursor glide with automatic 10s PiP oversight, zero hardware mouse disruption, and zero focus stealing (falls back to cursor/focus-restoring HID click on CEF/Chromium/no-AX targets unless hid=false).",
-                    "inputSchema": [
-                        "type": "object",
-                        "properties": [
-                            "x": ["type": "number", "description": "X coordinate in screen points"],
-                            "y": ["type": "number", "description": "Y coordinate in screen points"],
-                            "button": ["type": "string", "enum": ["left", "right", "middle"], "default": "left"],
-                            "count": ["type": "integer", "default": 1],
-                            "app": ["type": "string", "description": "Target application name if background"],
-                            "window": ["type": "integer", "description": "Target window ID"],
-                            "hid": ["type": "boolean", "description": "Override HID click fallback (true=force HID, false=strict zero-focus AX/postToPid)"],
-                            "done": ["type": "boolean", "description": "Also dismiss virtual cursor overlay after automatic PiP exit", "default": false]
-                        ],
-                        "required": ["x", "y"]
-                    ]
-                ],
-                [
-                    "name": "move",
-                    "description": "Smoothly glide the virtual cursor to target coordinates with automatic PiP oversight.",
-                    "inputSchema": [
-                        "type": "object",
-                        "properties": [
-                            "x": ["type": "number"],
-                            "y": ["type": "number"],
-                            "app": ["type": "string", "description": "Optional target application name"],
-                            "window": ["type": "integer", "description": "Optional target window ID"]
-                        ],
-                        "required": ["x", "y"]
-                    ]
-                ],
-                [
-                    "name": "type",
-                    "description": "Type text into target application with automatic PiP oversight and without stealing focus.",
-                    "inputSchema": [
-                        "type": "object",
-                        "properties": [
-                            "text": ["type": "string"],
-                            "app": ["type": "string", "description": "Target application name"],
-                            "window": ["type": "integer", "description": "Target window ID"],
-                            "done": ["type": "boolean", "default": false]
-                        ],
-                        "required": ["text"]
-                    ]
-                ],
-                [
-                    "name": "key",
-                    "description": "Press a key by name (return, tab, space, escape, etc.) with automatic PiP oversight.",
-                    "inputSchema": [
-                        "type": "object",
-                        "properties": [
-                            "name": ["type": "string"],
-                            "app": ["type": "string", "description": "Target application name"],
-                            "window": ["type": "integer", "description": "Target window ID"],
-                            "done": ["type": "boolean", "default": false]
-                        ],
-                        "required": ["name"]
-                    ]
-                ],
-                [
-                    "name": "screen_capture",
-                    "description": "Capture screenshot with coordinates.",
-                    "inputSchema": [
-                        "type": "object",
-                        "properties": [
-                            "output": ["type": "string", "default": "/tmp/mcu_screen.png"],
-                            "window": ["type": "integer"],
-                            "app": ["type": "string"],
-                            "rect": ["type": "string"]
-                        ]
-                    ]
-                ],
-                [
-                    "name": "window_capture",
-                    "description": "Capture an isolated, full-content screenshot of a specific window even when it is in the background or completely overshadowed/occluded by foreground applications. Supports targeting by app name or window ID.",
-                    "inputSchema": [
-                        "type": "object",
-                        "properties": [
-                            "app": ["type": "string", "description": "Target application name (e.g. 'iTerm2', 'Terminal', 'OpenChamber', 'Safari')"],
-                            "window": ["type": "integer", "description": "Target window ID"],
-                            "output": ["type": "string", "description": "Output image file path (default: /tmp/mcu_window_<wid>.png)"],
-                            "scale_1x": ["type": "boolean", "description": "Scale Retina to logical points resolution (default: true)", "default": true]
-                        ]
-                    ]
-                ],
-                [
-                    "name": "ocr",
-                    "description": "Perform high-speed Apple Vision OCR on a background window or full screen to recognize all visible text with exact bounding boxes and center coordinates.",
-                    "inputSchema": [
-                        "type": "object",
-                        "properties": [
-                            "app": ["type": "string", "description": "Target application name"],
-                            "window": ["type": "integer", "description": "Target window ID"],
-                            "fast": ["type": "boolean", "description": "Use fast OCR mode (default true)", "default": true]
-                        ]
-                    ]
-                ],
-                [
-                    "name": "click_text",
-                    "description": "Semantically find and click text inside a background window (including open popup menus/dropdowns) or on screen using Apple Vision OCR with automatic 10s PiP oversight and virtual cursor glide.",
-                    "inputSchema": [
-                        "type": "object",
-                        "properties": [
-                            "query": ["type": "string", "description": "Text substring or phrase to find and click"],
-                            "app": ["type": "string", "description": "Target application name"],
-                            "window": ["type": "integer", "description": "Target window ID"],
-                            "button": ["type": "string", "enum": ["left", "right", "middle"], "default": "left"],
-                            "count": ["type": "integer", "default": 1],
-                            "hid": ["type": "boolean", "description": "Override HID click fallback"],
-                            "done": ["type": "boolean", "description": "Also dismiss virtual cursor overlay after automatic PiP exit", "default": false]
-                        ],
-                        "required": ["query"]
-                    ]
-                ],
-                [
-                    "name": "scroll",
-                    "description": "Scroll wheel delta in a background window or at specific coordinates with automatic PiP oversight and without stealing focus.",
-                    "inputSchema": [
-                        "type": "object",
-                        "properties": [
-                            "dy": ["type": "integer", "description": "Vertical scroll delta (positive = up, negative = down)"],
-                            "dx": ["type": "integer", "description": "Horizontal scroll delta", "default": 0],
-                            "x": ["type": "number", "description": "X coordinate in screen points"],
-                            "y": ["type": "number", "description": "Y coordinate in screen points"],
-                            "app": ["type": "string", "description": "Target application name"],
-                            "window": ["type": "integer", "description": "Target window ID"],
-                            "done": ["type": "boolean", "default": false]
-                        ],
-                        "required": ["dy"]
-                    ]
-                ],
-                [
-                    "name": "select_range",
-                    "description": "Select a range of text or perform a drag selection in a background window with automatic PiP oversight and without stealing focus.",
-                    "inputSchema": [
-                        "type": "object",
-                        "properties": [
-                            "from_x": ["type": "number"],
-                            "from_y": ["type": "number"],
-                            "to_x": ["type": "number"],
-                            "to_y": ["type": "number"],
-                            "app": ["type": "string"],
-                            "window": ["type": "integer"],
-                            "done": ["type": "boolean", "default": false]
-                        ],
-                        "required": ["from_x", "from_y", "to_x", "to_y"]
-                    ]
-                ],
-                [
-                    "name": "pip_show",
-                    "description": "Show live PiP preview stream of a target window.",
-                    "inputSchema": [
-                        "type": "object",
-                        "properties": [
-                            "app": ["type": "string"],
-                            "window": ["type": "integer"]
-                        ]
-                    ]
-                ],
-                [
-                    "name": "pip_hide",
-                    "description": "Close all active PiP live previews.",
-                    "inputSchema": ["type": "object", "properties": [:]]
-                ],
-                [
-                    "name": "window_list",
-                    "description": "List all on-screen windows with IDs, titles, bounds, and apps.",
-                    "inputSchema": ["type": "object", "properties": [:]]
-                ],
-                [
-                    "name": "done",
-                    "description": "Complete computer use session and clean up PiP and virtual cursor.",
-                    "inputSchema": ["type": "object", "properties": [:]]
-                ],
-                [
-                    "name": "hotkey",
-                    "description": "Trigger a shortcut combo like 'cmd+shift+n' in target application with automatic PiP oversight and without stealing focus.",
-                    "inputSchema": [
-                        "type": "object",
-                        "properties": [
-                            "combo": ["type": "string", "description": "Shortcut combo (e.g. 'cmd+shift+n', 'cmd+t', 'cmd+c')"],
-                            "app": ["type": "string", "description": "Target application name"],
-                            "window": ["type": "integer", "description": "Target window ID"],
-                            "done": ["type": "boolean", "default": false]
-                        ],
-                        "required": ["combo"]
-                    ]
-                ],
-                [
-                    "name": "browser_open",
-                    "description": "Open a URL in a browser (Safari/Chrome) completely in the background without stealing focus, with optional private/incognito mode and live PiP oversight.",
-                    "inputSchema": [
-                        "type": "object",
-                        "properties": [
-                            "url": ["type": "string", "description": "URL to open"],
-                            "app": ["type": "string", "description": "Browser name (default 'Safari')", "default": "Safari"],
-                            "private": ["type": "boolean", "description": "Open in Private/Incognito mode (default false)", "default": false]
-                        ],
-                        "required": ["url"]
-                    ]
-                ]
-            ]
             let resp: [String: Any] = [
                 "jsonrpc": "2.0",
                 "id": id ?? 1,
                 "result": [
-                    "tools": tools
+                    "tools": buildMCPToolsList()
                 ]
             ]
             sendMCPResponse(resp)
