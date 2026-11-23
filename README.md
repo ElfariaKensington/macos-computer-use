@@ -10,7 +10,7 @@ A native Swift CLI and stdio **MCP server** that gives AI agents low-latency, no
 
 - **Non-Disruptive Virtual Cursor**: Renders a smooth, click-through floating pointer overlay (`.nonactivatingPanel`) with click ripples — your physical trackpad/mouse pointer is never displaced.
 - **Live ScreenCaptureKit PiP Oversight**: Streams the target window in a persistent floating Picture-in-Picture preview with frosted-glass controls, edge docking, and mirrored virtual cursor movement.
-- **Zero-Focus Background Click, Type & Scroll**: Sends targeted clicks (`AXPress` hit-testing + PID-scoped events), text input, hotkeys, range selections, and smooth scrolling to background apps (including Safari/WebKit) **without stealing window focus**.
+- **Zero-Focus Background Click, Type & Scroll**: Sends targeted clicks (`AXPress` hit-testing + SkyLight PID-routed events), text input, hotkeys, drags, hover, range selections, and scrolling to background apps — AppKit, SwiftUI, Safari/WebKit, Chrome/Chromium, Electron, and Steam/CEF — **without activating the app, raising its window, or moving your cursor**.
 - **Isolated Background Window Capture (`mcu window capture`)**: Captures occluded or background windows upright at 1:1 Retina logical point resolution without shadows or overlapping windows.
 - **On-Device Apple Vision OCR (`mcu ocr`, `mcu click text`)**: Extracts text and exact screen bounding boxes in ~200ms and lets the agent click UI text semantically.
 - **Native Stdio MCP Server (`mcu mcp`)**: Exposes 16 ready-to-use tools (`click`, `move`, `type`, `key`, `hotkey`, `scroll`, `select_range`, `click_text`, `ocr`, `screen_capture`, `window_capture`, `window_list`, `pip_show`, `pip_hide`, `browser_open`, `done`) over JSON-RPC 2.0.

@@ -4503,14 +4503,16 @@ func selectRangeAction(from: CGPoint, to: CGPoint, targetPID: pid_t? = nil, wind
         if let p = pid {
             let axSuccess = selectRangeInBackground(pid: p, from: from, to: to)
             if !axSuccess {
-                let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: from, mouseButton: .left)
-                down?.postToPid(p)
+                let selWID = BGInput.windowFor(pid: p, at: from) ?? resolvedWID
+                let keyRestore = BGInput.prepare(pid: p, wid: selWID, forKeyboard: false)
+                BGInput.postMouse(.mouseMoved, at: from, pid: p, wid: selWID)
+                usleep(15000)
+                BGInput.postMouse(.leftMouseDown, at: from, pid: p, wid: selWID, clickState: 1)
                 usleep(20000)
-                let drag = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: to, mouseButton: .left)
-                drag?.postToPid(p)
+                BGInput.postMouse(.leftMouseDragged, at: to, pid: p, wid: selWID, clickState: 1)
                 usleep(20000)
-                let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: to, mouseButton: .left)
-                up?.postToPid(p)
+                BGInput.postMouse(.leftMouseUp, at: to, pid: p, wid: selWID, clickState: 1)
+                BGInput.restore(keyRestore)
             }
         } else {
             dragMouse(from: from, to: to, duration: 0.4, restoreCursor: true)
@@ -4567,6 +4569,227 @@ func setTargetWindow(_ event: CGEvent?, windowID: CGWindowID?) {
     let w = Int64(wid)
     ev.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: w)
     ev.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: w)
+}
+
+// MARK: - Background Input (SkyLight)
+//
+// Zero-focus input delivery. Events go to one pid through SkyLight's SLEventPostToPid, which
+// Chromium/Electron accept (they drop public CGEvent.postToPid clicks as untrusted). Mouse events
+// carry the target pid (field 40), window id (51/91/92) and a CGEventSetWindowLocation stamp so
+// AppKit routes them to the exact window. Keyboard events carry an SLSEventAuthenticationMessage.
+// Never activates the app, never raises a window, never moves the hardware cursor.
+// Do NOT stamp field 0 (event number/phase) or 58 (click group): on Chrome 14x they crash the
+// renderer ("Aw, Snap! error 5") when the click navigates (verified 2026-11-23, macOS 27.3).
+enum BGInput {
+    private typealias PostFn = @convention(c) (pid_t, CGEvent) -> Void
+    private typealias SetFieldFn = @convention(c) (CGEvent, UInt32, Int64) -> Void
+    private typealias SetLocFn = @convention(c) (CGEvent, CGPoint) -> Void
+    private typealias PostRecFn = @convention(c) (UnsafeRawPointer, UnsafeRawPointer) -> Int32
+    private typealias PSNFn = @convention(c) (pid_t, UnsafeMutableRawPointer) -> Int32
+    private typealias SetAuthFn = @convention(c) (CGEvent, AnyObject) -> Void
+    private typealias AuthFactoryFn = @convention(c) (AnyClass, Selector, UnsafeMutableRawPointer, Int32, UInt32) -> Unmanaged<AnyObject>?
+
+    private static let skyHandle: UnsafeMutableRawPointer? = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW)
+    private static func sym(_ name: String) -> UnsafeMutableRawPointer? {
+        if let h = skyHandle, let p = dlsym(h, name) { return p }
+        return dlsym(UnsafeMutableRawPointer(bitPattern: -2), name) // RTLD_DEFAULT
+    }
+    private static let slPost: PostFn? = sym("SLEventPostToPid").map { unsafeBitCast($0, to: PostFn.self) }
+    private static let slSetField: SetFieldFn? = sym("SLEventSetIntegerValueField").map { unsafeBitCast($0, to: SetFieldFn.self) }
+    private static let setWindowLocation: SetLocFn? = sym("CGEventSetWindowLocation").map { unsafeBitCast($0, to: SetLocFn.self) }
+    private static let postRecord: PostRecFn? = sym("SLPSPostEventRecordTo").map { unsafeBitCast($0, to: PostRecFn.self) }
+    private static let processForPID: PSNFn? = sym("GetProcessForPID").map { unsafeBitCast($0, to: PSNFn.self) }
+    private static let setAuth: SetAuthFn? = sym("SLEventSetAuthenticationMessage").map { unsafeBitCast($0, to: SetAuthFn.self) }
+
+    /// macOS 27+ expects the window-local point in CGEventSetWindowLocation; earlier releases the screen point.
+    private static let windowLocalStamp = ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27
+
+    static var available: Bool { slPost != nil }
+
+    private static func setField(_ e: CGEvent, _ field: UInt32, _ value: Int64) {
+        if let f = slSetField { f(e, field, value) }
+        else if let cgField = CGEventField(rawValue: field) { e.setIntegerValueField(cgField, value: value) }
+    }
+
+    static func windowBounds(_ wid: CGWindowID) -> CGRect? {
+        guard let list = CGWindowListCopyWindowInfo([.optionIncludingWindow], wid) as? [[String: Any]],
+              let dict = list.first?[kCGWindowBounds as String] else { return nil }
+        return CGRect(dictionaryRepresentation: dict as! CFDictionary)
+    }
+
+    /// Topmost normal window of `pid` containing `pt` (falls back to the pid's first window).
+    static func windowFor(pid: pid_t, at pt: CGPoint?) -> CGWindowID? {
+        if let pt, let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+            for info in list {
+                guard (info[kCGWindowOwnerPID as String] as? Int).map(pid_t.init) == pid,
+                      (info[kCGWindowLayer as String] as? Int) == 0,
+                      let b = info[kCGWindowBounds as String], let r = CGRect(dictionaryRepresentation: b as! CFDictionary),
+                      r.contains(pt), let id = info[kCGWindowNumber as String] as? Int else { continue }
+                return CGWindowID(id)
+            }
+        }
+        return firstWindowID(matchingPID: pid)
+    }
+
+    private static func axWindow(pid: pid_t, wid: CGWindowID) -> AXUIElement? {
+        let appEl = AXUIElementCreateApplication(pid)
+        guard let windows = getAttribute(appEl, kAXWindowsAttribute) as? [AXUIElement] else { return nil }
+        for w in windows {
+            var id: CGWindowID = 0
+            if _AXUIElementGetWindow(w, &id) == .success, id == wid { return w }
+        }
+        return nil
+    }
+
+    static func focusedWindowID(pid: pid_t) -> CGWindowID? {
+        let appEl = AXUIElementCreateApplication(pid)
+        guard let ref = getAttribute(appEl, kAXFocusedWindowAttribute) else { return nil }
+        var id: CGWindowID = 0
+        return _AXUIElementGetWindow(ref as! AXUIElement, &id) == .success && id != 0 ? id : nil
+    }
+
+    @discardableResult
+    private static func setMainWindow(pid: pid_t, wid: CGWindowID) -> Bool {
+        guard let w = axWindow(pid: pid, wid: wid) else { return false }
+        return AXUIElementSetAttributeValue(w, kAXMainAttribute as CFString, kCFBooleanTrue) == .success
+    }
+
+    /// yabai focus-without-raise record (0x0d, direction 0x01) posted to the target process only:
+    /// the process makes `wid` its key window internally without activating or raising anything.
+    @discardableResult
+    private static func postFocusRecord(pid: pid_t, wid: CGWindowID) -> Bool {
+        guard let postRecord, let processForPID else { return false }
+        var psn = [UInt32](repeating: 0, count: 2)
+        guard psn.withUnsafeMutableBytes({ processForPID(pid, $0.baseAddress!) }) == 0 else { return false }
+        var rec = [UInt8](repeating: 0, count: 0xF8)
+        rec[0x04] = 0xF8
+        rec[0x08] = 0x0D
+        withUnsafeBytes(of: wid.littleEndian) { for i in 0..<4 { rec[0x3C + i] = $0[i] } }
+        rec[0x8A] = 0x01
+        return psn.withUnsafeBytes { p in rec.withUnsafeBytes { postRecord(p.baseAddress!, $0.baseAddress!) } } == 0
+    }
+
+    /// Key window to hand back to the user after delivering into a sibling window of the frontmost app.
+    struct KeyRestore {
+        let pid: pid_t
+        let userWID: CGWindowID
+    }
+
+    /// Route subsequent pid-targeted input to `wid` without activating its app.
+    /// - Background app: focus-without-raise record, so its key window becomes `wid` in-process only.
+    /// - Frontmost app, user working in a sibling window: keyboard input needs `wid` key for the
+    ///   delivery, so it is made main and the user's window is restored afterwards (`restore`).
+    ///   Clicks need no preparation there; AppKit keys the clicked window and `restore` undoes it.
+    static func prepare(pid: pid_t, wid: CGWindowID?, forKeyboard: Bool) -> KeyRestore? {
+        guard let wid else { return nil }
+        let current = focusedWindowID(pid: pid)
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
+            // Always post, even when `wid` is already the app's key window: without the record an
+            // inactive AppKit app treats the click as a first-mouse activation click (NSTextView
+            // ignores it) and drops menu key equivalents such as cmd+s.
+            postFocusRecord(pid: pid, wid: wid)
+            usleep(50_000)
+            return nil
+        }
+        guard let userWID = current, userWID != wid else { return nil }
+        if forKeyboard {
+            setMainWindow(pid: pid, wid: wid)
+            usleep(80_000)
+        }
+        return KeyRestore(pid: pid, userWID: userWID)
+    }
+
+    static func restore(_ token: KeyRestore?) {
+        guard let t = token else { return }
+        usleep(60_000)
+        if focusedWindowID(pid: t.pid) != t.userWID {
+            setMainWindow(pid: t.pid, wid: t.userWID)
+        }
+    }
+
+    private static func attachAuthentication(_ e: CGEvent, pid: pid_t) {
+        guard let setAuth, let cls: AnyClass = NSClassFromString("SLSEventAuthenticationMessage") else { return }
+        let sel = NSSelectorFromString("messageWithEventRecord:pid:version:")
+        guard let method = class_getClassMethod(cls, sel) else { return } // selector added in macOS 15
+        let factory = unsafeBitCast(method_getImplementation(method), to: AuthFactoryFn.self)
+        // __CGEvent layout: {CFRuntimeBase, uint32_t, SLSEventRecord *}; probe like cua-driver does.
+        let raw = Unmanaged.passUnretained(e).toOpaque()
+        var record: UnsafeMutableRawPointer? = nil
+        for offset in [24, 32, 16] {
+            if let p = raw.load(fromByteOffset: offset, as: UnsafeMutableRawPointer?.self) { record = p; break }
+        }
+        guard let rec = record, let msg = factory(cls, sel, rec, pid, 0)?.takeUnretainedValue() else { return }
+        setAuth(e, msg)
+    }
+
+    static func post(_ e: CGEvent, pid: pid_t, authenticate: Bool = false) {
+        if let slPost {
+            if authenticate { attachAuthentication(e, pid: pid) }
+            slPost(pid, e)
+        } else {
+            e.postToPid(pid)
+        }
+    }
+
+    static func makeMouseEvent(_ type: CGEventType, at pt: CGPoint, button: CGMouseButton = .left, pid: pid_t, wid: CGWindowID?, clickState: Int64 = 0) -> CGEvent? {
+        let src = CGEventSource(stateID: .hidSystemState)
+        guard let e = CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: pt, mouseButton: button) else { return nil }
+        stampMouse(e, at: pt, button: button, pid: pid, wid: wid, clickState: clickState)
+        return e
+    }
+
+    static func stampMouse(_ e: CGEvent, at pt: CGPoint, button: CGMouseButton = .left, pid: pid_t, wid: CGWindowID?, clickState: Int64 = 0, routingOnly: Bool = false) {
+        if !routingOnly {
+            e.setIntegerValueField(.mouseEventClickState, value: clickState)
+            e.setIntegerValueField(.mouseEventButtonNumber, value: Int64(button.rawValue))
+        }
+        setField(e, 40, Int64(pid)) // kCGEventTargetUnixProcessID: Chromium synthetic-event filter
+        guard let wid else { return }
+        setField(e, 51, Int64(wid)) // windowNumber
+        setField(e, 91, Int64(wid)) // kCGMouseEventWindowUnderMousePointer
+        setField(e, 92, Int64(wid)) // ...ThatCanHandleThisEvent
+        if let setWindowLocation {
+            var stamp = pt
+            if windowLocalStamp, pt.x >= 0, pt.y >= 0, let b = windowBounds(wid) {
+                stamp = CGPoint(x: pt.x - b.minX, y: pt.y - b.minY)
+            }
+            setWindowLocation(e, stamp)
+        }
+    }
+
+    static func postMouse(_ type: CGEventType, at pt: CGPoint, button: CGMouseButton = .left, pid: pid_t, wid: CGWindowID?, clickState: Int64 = 0) {
+        if let e = makeMouseEvent(type, at: pt, button: button, pid: pid, wid: wid, clickState: clickState) {
+            post(e, pid: pid)
+        }
+    }
+
+    /// Background click: hover primer, off-screen user-activation primer (left button), then the click pair(s).
+    static func click(at pt: CGPoint, button: CGMouseButton, clickCount: Int, pid: pid_t, wid: CGWindowID?, onEachClick: (() -> Void)? = nil) {
+        let (downType, upType): (CGEventType, CGEventType) = {
+            switch button {
+            case .right: return (.rightMouseDown, .rightMouseUp)
+            case .center: return (.otherMouseDown, .otherMouseUp)
+            default: return (.leftMouseDown, .leftMouseUp)
+            }
+        }()
+        postMouse(.mouseMoved, at: pt, pid: pid, wid: wid)
+        usleep(15_000)
+        if button == .left && available {
+            // Chromium's user-activation gate: a click pair no window claims, then the real gesture.
+            let off = CGPoint(x: -1, y: -1)
+            postMouse(.leftMouseDown, at: off, pid: pid, wid: wid, clickState: 1)
+            usleep(1_000)
+            postMouse(.leftMouseUp, at: off, pid: pid, wid: wid, clickState: 1)
+            usleep(100_000)
+        }
+        for i in 1...max(1, clickCount) {
+            onEachClick?()
+            postMouse(downType, at: pt, button: button, pid: pid, wid: wid, clickState: Int64(i))
+            usleep(i == 1 ? 1_000 : 40_000)
+            postMouse(upType, at: pt, button: button, pid: pid, wid: wid, clickState: Int64(i))
+            if i < clickCount { usleep(80_000) }
+        }
+    }
 }
 
 func resolveActionTarget(
@@ -4814,7 +5037,11 @@ func clickMouseNonDisruptive(
                     }
                 }
 
-                if let ctrl = matchedControl {
+                // Text inputs need a real (background) click to take the caret and DOM focus; AXPress does not focus them.
+                if let ctrl = matchedControl, BGInput.available,
+                   focusableRoles.contains(getAttribute(ctrl, kAXRoleAttribute) as? String ?? "") {
+                    axHitRole = getAttribute(ctrl, kAXRoleAttribute) as? String
+                } else if let ctrl = matchedControl {
                     // NEVER set kAXFocusedAttribute = true on WebKit/AppKit background elements as WebKit calls makeKeyAndOrderFront!
                     // Instead, perform kAXPressAction and track the clicked input coordinate for subsequent keyboard typing.
                     if AXUIElementPerformAction(ctrl, kAXPressAction as CFString) == .success {
@@ -4840,7 +5067,9 @@ func clickMouseNonDisruptive(
             case .disabled:
                 shouldUseHID = false
             case .auto:
-                shouldUseHID = (button == .left) && resolvedPID != nil && (
+                // SkyLight delivery reaches Chromium/CEF and no-AX surfaces without focus; HID (which
+                // activates the app and moves the real cursor) is only an automatic fallback without it.
+                shouldUseHID = !BGInput.available && (button == .left) && resolvedPID != nil && (
                     axHitRole == nil ||
                     axHitRole == "AXWindow" ||
                     isChromiumOrCEFProcess(pid: resolvedPID)
@@ -4859,30 +5088,24 @@ func clickMouseNonDisruptive(
                     restoreCursor: restoreCursor
                 )
                 deliveryMode = (hidMode == .force) ? "HID click (cursor/focus restored)" : "HID fallback (CEF/no-AX target; cursor/focus restored)"
-            } else {
-                let source = CGEventSource(stateID: .hidSystemState)
-                func postTargeted(_ type: CGEventType, clickState: Int64) {
-                    let ev = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: pt, mouseButton: button)
-                    setTargetWindow(ev, windowID: resolvedWID)
-                    ev?.setIntegerValueField(.mouseEventClickState, value: clickState)
-                    if let pid = resolvedPID {
-                        ev?.postToPid(pid)
-                    }
+            } else if let pid = resolvedPID {
+                // An app-only target resolves to the app's topmost window; route to the window actually under pt.
+                let wid: CGWindowID? = {
+                    if let w = resolvedWID, let b = BGInput.windowBounds(w), b.contains(pt) { return w }
+                    return BGInput.windowFor(pid: pid, at: pt) ?? resolvedWID
+                }()
+                let restore = BGInput.prepare(pid: pid, wid: wid, forKeyboard: false)
+                let buttonName = (button == .right ? "right" : (button == .center ? "middle" : "left"))
+                BGInput.click(at: pt, button: button, clickCount: clickCount, pid: pid, wid: wid) {
+                    VirtualCursorClient.click(at: pt, button: buttonName)
                 }
-
-                // Deliver a targeted mouseMoved first so Chromium/CEF & AppKit tracking areas register hover at pt
-                postTargeted(.mouseMoved, clickState: 0)
-                usleep(60000)
-
-                for i in 1...clickCount {
-                    VirtualCursorClient.click(at: pt, button: (button == .right ? "right" : (button == .center ? "middle" : "left")))
-                    postTargeted(downType, clickState: Int64(i))
-                    usleep(40000)
-                    postTargeted(upType, clickState: Int64(i))
-                    if i < clickCount { usleep(120000) }
+                BGInput.restore(restore)
+                if let wid {
+                    try? "\(wid)".write(toFile: "/tmp/mcu_last_target_wid.txt", atomically: true, encoding: .utf8)
                 }
-                if hidMode == .disabled && (axHitRole == nil || axHitRole == "AXWindow" || isChromiumOrCEFProcess(pid: resolvedPID)) {
-                    deliveryMode = "Zero-focus background delivery; if this CEF/no-AX control did not respond, retry with hid=true and hid_reason"
+                deliveryMode = BGInput.available ? "Zero-focus SkyLight background delivery" : "Zero-focus background delivery"
+                if !BGInput.available && hidMode == .disabled && (axHitRole == nil || axHitRole == "AXWindow" || isChromiumOrCEFProcess(pid: resolvedPID)) {
+                    deliveryMode += "; if this CEF/no-AX control did not respond, retry with hid=true and hid_reason"
                 }
             }
         }
@@ -4916,6 +5139,10 @@ func moveMouseVirtual(to target: CGPoint, speed: String? = nil, duration: Double
         // Only moves the fancy overlay cursor - NEVER displaces the user's actual mouse!
         VirtualCursorClient.move(to: target, speed: speed, duration: duration)
         usleep(450000)
+        // Deliver a pid-routed mouseMoved so hover states/tooltips trigger in the background window.
+        if let pid = actionTarget.pid {
+            BGInput.postMouse(.mouseMoved, at: target, pid: pid, wid: BGInput.windowFor(pid: pid, at: target) ?? actionTarget.windowID)
+        }
     }
     AccessControlEngine.logAudit(action: "cursor_move", details: "Point (\(Int(target.x)), \(Int(target.y)))")
     let msg = "Fancy agent cursor moved to (\(Int(target.x)), \(Int(target.y))) [Zero user disruption]"
@@ -4947,9 +5174,11 @@ func dragMouse(from start: CGPoint, to end: CGPoint, duration: Double = 0.4, res
         usleep(180000)
 
         if let pid = resolvedPID {
-            let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left)
-            setTargetWindow(down, windowID: resolvedWID)
-            down?.postToPid(pid)
+            let dragWID = BGInput.windowFor(pid: pid, at: start) ?? resolvedWID
+            let keyRestore = BGInput.prepare(pid: pid, wid: dragWID, forKeyboard: false)
+            BGInput.postMouse(.mouseMoved, at: start, pid: pid, wid: dragWID)
+            usleep(15000)
+            BGInput.postMouse(.leftMouseDown, at: start, pid: pid, wid: dragWID, clickState: 1)
             usleep(20000)
 
             let steps = max(10, Int(duration * 40))
@@ -4963,15 +5192,12 @@ func dragMouse(from start: CGPoint, to end: CGPoint, duration: Double = 0.4, res
                 if i % 3 == 0 || i == steps {
                     VirtualCursorClient.move(to: pt, speed: "instant")
                 }
-                let drag = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: pt, mouseButton: .left)
-                setTargetWindow(drag, windowID: resolvedWID)
-                drag?.postToPid(pid)
+                BGInput.postMouse(.leftMouseDragged, at: pt, pid: pid, wid: dragWID, clickState: 1)
                 usleep(useconds_t(duration / Double(steps) * 1_000_000))
             }
 
-            let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left)
-            setTargetWindow(up, windowID: resolvedWID)
-            up?.postToPid(pid)
+            BGInput.postMouse(.leftMouseUp, at: end, pid: pid, wid: dragWID, clickState: 1)
+            BGInput.restore(keyRestore)
         } else {
             let originalUserPos = getMousePosition()
 
@@ -5121,8 +5347,14 @@ func scrollWheel(dx: Int32, dy: Int32, at: CGPoint? = nil, targetPID: pid_t? = n
         if let loc = at {
             event?.location = loc
         }
-        if let pid = resolvedPID {
-            event?.postToPid(pid)
+        if let pid = resolvedPID, let event {
+            // Wheel events are hit-tested at the point: stamp pid/window routing so backgrounded
+            // Chromium/WebKit scroll the element under `at` without focus.
+            let loc = at ?? event.location
+            let scrollWID = BGInput.windowFor(pid: pid, at: at) ?? resolvedWID
+            BGInput.postMouse(.mouseMoved, at: loc, pid: pid, wid: scrollWID)
+            BGInput.stampMouse(event, at: loc, pid: pid, wid: scrollWID, routingOnly: true)
+            BGInput.post(event, pid: pid)
         } else {
             event?.post(tap: .cghidEventTap)
         }
@@ -5172,6 +5404,19 @@ func scrollWheel(dx: Int32, dy: Int32, at: CGPoint? = nil, targetPID: pid_t? = n
     return (true, msg)
 }
 
+/// Window that keyboard input for `pid` should land in: the explicit one, else the window of the last
+/// background click into that app, else the app's current key window (no change).
+func keyboardTargetWindow(pid: pid_t, explicit: CGWindowID?) -> CGWindowID? {
+    if let explicit { return explicit }
+    if let str = try? String(contentsOfFile: "/tmp/mcu_last_target_wid.txt", encoding: .utf8),
+       let wid = CGWindowID(str.trimmingCharacters(in: .whitespacesAndNewlines)),
+       let list = CGWindowListCopyWindowInfo([.optionIncludingWindow], wid) as? [[String: Any]],
+       (list.first?[kCGWindowOwnerPID as String] as? Int).map(pid_t.init) == pid {
+        return wid
+    }
+    return nil
+}
+
 func resolveLastTargetPID(explicitPID: pid_t?) -> pid_t? {
     if let p = explicitPID { return p }
     if let str = try? String(contentsOfFile: "/tmp/mcu_last_target_pid.txt", encoding: .utf8),
@@ -5219,7 +5464,7 @@ func resolveFocusedAXElement(for pid: pid_t) -> AXUIElement? {
     return nil
 }
 
-func typeString(_ text: String, targetPID: pid_t? = nil) {
+func typeString(_ text: String, targetPID: pid_t? = nil, windowID: CGWindowID? = nil) {
     let validation = AccessControlEngine.validate(action: "keyboard_type")
     if !validation.allowed {
         fputs("\(validation.reason)\n", stderr)
@@ -5236,29 +5481,31 @@ func typeString(_ text: String, targetPID: pid_t? = nil) {
         beforeVal = getAttribute(el, kAXValueAttribute) as? String ?? ""
     }
     
+    let keyRestore = resolvedPID.flatMap { BGInput.prepare(pid: $0, wid: keyboardTargetWindow(pid: $0, explicit: windowID), forKeyboard: true) }
     let source = CGEventSource(stateID: .hidSystemState)
     for char in text {
         let utf16 = Array(String(char).utf16)
         let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true)
         down?.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
-        if let pid = resolvedPID {
-            down?.postToPid(pid)
+        if let pid = resolvedPID, let down {
+            BGInput.post(down, pid: pid, authenticate: true)
         }
         
         usleep(2000)
         
         let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
         up?.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
-        if let pid = resolvedPID {
-            up?.postToPid(pid)
+        if let pid = resolvedPID, let up {
+            BGInput.post(up, pid: pid, authenticate: true)
         }
         
         usleep(4000)
     }
+    BGInput.restore(keyRestore)
     
     // If background inactive window ignored raw CGEvent keystrokes on a focused AX text input, apply via native AXValue
     if let el = focusedEl {
-        usleep(15000)
+        usleep(150000)
         let afterVal = getAttribute(el, kAXValueAttribute) as? String ?? ""
         var settable: DarwinBoolean = false
         AXUIElementIsAttributeSettable(el, kAXValueAttribute as CFString, &settable)
@@ -5272,29 +5519,33 @@ func typeString(_ text: String, targetPID: pid_t? = nil) {
     emitOutput("Typed: \"\(text)\" \(resolvedPID != nil ? "[Target PID: \(resolvedPID!)] (Zero-focus background delivery)" : "")")
 }
 
-func pressKey(keyCode: CGKeyCode, flags: CGEventFlags = [], targetPID: pid_t? = nil) {
+func pressKey(keyCode: CGKeyCode, flags: CGEventFlags = [], targetPID: pid_t? = nil, windowID: CGWindowID? = nil) {
     let resolvedPID = resolveLastTargetPID(explicitPID: targetPID)
+    let keyRestore = resolvedPID.flatMap { BGInput.prepare(pid: $0, wid: keyboardTargetWindow(pid: $0, explicit: windowID), forKeyboard: true) }
     let source = CGEventSource(stateID: .hidSystemState)
     let down = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true)
     down?.flags = flags
-    if let pid = resolvedPID {
-        down?.postToPid(pid)
+    if let pid = resolvedPID, let down {
+        BGInput.post(down, pid: pid, authenticate: true)
     }
     
     usleep(15000)
     
     let up = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false)
     up?.flags = flags
-    if let pid = resolvedPID {
-        up?.postToPid(pid)
+    if let pid = resolvedPID, let up {
+        BGInput.post(up, pid: pid, authenticate: true)
     }
+    BGInput.restore(keyRestore)
     
-    if let pid = resolvedPID, (keyCode == 0x24 || keyCode == 0x4C), let el = resolveFocusedAXElement(for: pid) {
+    // Legacy fallback for unauthenticated delivery only; with SkyLight the Return key itself arrives and a
+    // second AXConfirm would double-submit forms.
+    if !BGInput.available, let pid = resolvedPID, (keyCode == 0x24 || keyCode == 0x4C), let el = resolveFocusedAXElement(for: pid) {
         AXUIElementPerformAction(el, kAXConfirmAction as CFString)
     }
 }
 
-func triggerHotkeyCombo(_ combo: String, targetPID: pid_t? = nil) {
+func triggerHotkeyCombo(_ combo: String, targetPID: pid_t? = nil, windowID: CGWindowID? = nil) {
     let validation = AccessControlEngine.validate(action: "keyboard_hotkey", hotkey: combo)
     if !validation.allowed {
         fputs("\(validation.reason)\n", stderr)
@@ -5306,7 +5557,7 @@ func triggerHotkeyCombo(_ combo: String, targetPID: pid_t? = nil) {
         fputs("Error: Failed to parse hotkey combo '\(combo)'\n", stderr)
         return
     }
-    pressKey(keyCode: parsed.keyCode, flags: parsed.flags, targetPID: targetPID)
+    pressKey(keyCode: parsed.keyCode, flags: parsed.flags, targetPID: targetPID, windowID: windowID)
     AccessControlEngine.logAudit(action: "keyboard_hotkey", details: "\(combo) \(targetPID != nil ? "[PID: \(targetPID!)]" : "")")
     emitOutput("Triggered hotkey combo '\(combo)' \(targetPID != nil ? "[Target PID: \(targetPID!)] (Overshadowed background delivery)" : "")")
 }
@@ -6325,7 +6576,7 @@ private func executeMCPToolCall(name: String, args: [String: Any]) -> (text: Str
         }
         let kbTarget = resolveKeyboardPiPTarget(explicitPID: resolved.pid, explicitWID: resolved.windowID)
         withAutoPiP(windowID: kbTarget.windowID, appName: app, pid: kbTarget.pid) {
-            typeString(text, targetPID: kbTarget.pid)
+            typeString(text, targetPID: kbTarget.pid, windowID: wid)
         }
         if (args["done"] as? Bool) == true {
             VirtualCursorClient.done()
@@ -6347,7 +6598,7 @@ private func executeMCPToolCall(name: String, args: [String: Any]) -> (text: Str
         }
         let kbTarget = resolveKeyboardPiPTarget(explicitPID: resolved.pid, explicitWID: resolved.windowID)
         withAutoPiP(windowID: kbTarget.windowID, appName: app, pid: kbTarget.pid) {
-            pressKey(keyCode: code, targetPID: kbTarget.pid)
+            pressKey(keyCode: code, targetPID: kbTarget.pid, windowID: wid)
         }
         if (args["done"] as? Bool) == true {
             VirtualCursorClient.done()
@@ -6366,7 +6617,7 @@ private func executeMCPToolCall(name: String, args: [String: Any]) -> (text: Str
         }
         let kbTarget = resolveKeyboardPiPTarget(explicitPID: resolved.pid, explicitWID: resolved.windowID)
         withAutoPiP(windowID: kbTarget.windowID, appName: app, pid: kbTarget.pid) {
-            triggerHotkeyCombo(combo, targetPID: kbTarget.pid)
+            triggerHotkeyCombo(combo, targetPID: kbTarget.pid, windowID: wid)
         }
         if (args["done"] as? Bool) == true {
             VirtualCursorClient.done()
