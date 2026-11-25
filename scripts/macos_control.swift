@@ -37,6 +37,7 @@ let kDefaultConfigPath = kMCURootDirectory + "/config/access_control.json"
 let kDefaultAuditLogPath = kMCURootDirectory + "/logs/audit.jsonl"
 let kDefaultKillSwitchPath = "/tmp/mcu_kill.lock"
 let kCursorDaemonPIDPath = "/tmp/mcu_cursor_daemon.pid"
+let kCursorDaemonReadyPath = "/tmp/mcu_cursor_daemon_ready.txt"
 
 var isMCPServerMode = false
 var isCursorDaemonProcess = false
@@ -119,6 +120,15 @@ func findRunningApplication(matching name: String) -> NSRunningApplication? {
 
 func cursorDaemonPID() -> pid_t? {
     guard let s = try? String(contentsOfFile: kCursorDaemonPIDPath, encoding: .utf8),
+          let p = Int32(s.trimmingCharacters(in: .whitespacesAndNewlines)),
+          p > 1, kill(p, 0) == 0 else {
+        return nil
+    }
+    return p
+}
+
+func cursorDaemonReadyPID() -> pid_t? {
+    guard let s = try? String(contentsOfFile: kCursorDaemonReadyPath, encoding: .utf8),
           let p = Int32(s.trimmingCharacters(in: .whitespacesAndNewlines)),
           p > 1, kill(p, 0) == 0 else {
         return nil
@@ -415,13 +425,37 @@ func withAutoPiP<T>(
     }()
 
     let timeout = autoPiPTimeoutSeconds()
+    let readyPath = pipReadyPath(for: Int(activeWID))
+    let needsActivationWait = !alreadyActiveSameWindow || !FileManager.default.fileExists(atPath: readyPath)
     VirtualCursorClient.autoPiPBegin(
         appName: appName,
         windowID: Int(activeWID),
         inFlightTimeout: max(timeout * 3.0, 30.0)
     )
-    if !alreadyActiveSameWindow {
-        usleep(180_000)
+    if needsActivationWait {
+        let start = Date()
+        var retried = false
+        while Date().timeIntervalSince(start) < 1.0 {
+            if FileManager.default.fileExists(atPath: readyPath) {
+                break
+            }
+            if let pipErr = try? String(contentsOfFile: kPiPLastErrorPath, encoding: .utf8),
+               !pipErr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                break
+            }
+            if !FileManager.default.fileExists(atPath: "/tmp/mcu_active_pip_wid.txt") {
+                break
+            }
+            if !retried && Date().timeIntervalSince(start) >= 0.32 {
+                retried = true
+                VirtualCursorClient.autoPiPBegin(
+                    appName: appName,
+                    windowID: Int(activeWID),
+                    inFlightTimeout: max(timeout * 3.0, 30.0)
+                )
+            }
+            usleep(40_000)
+        }
     }
     defer {
         VirtualCursorClient.autoPiPEnd(windowID: Int(activeWID), timeout: timeout)
@@ -841,7 +875,15 @@ struct VirtualCursorClient {
     
     static func ensureDaemonRunning() {
         guard isEnabled, !isCursorDaemonProcess else { return }
-        if cursorDaemonPID() != nil { return }
+        if let pid = cursorDaemonPID() {
+            if cursorDaemonReadyPID() != pid {
+                for _ in 0..<10 {
+                    if cursorDaemonReadyPID() == pid { break }
+                    usleep(50_000)
+                }
+            }
+            return
+        }
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
@@ -853,6 +895,7 @@ struct VirtualCursorClient {
         let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
 
         if out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            try? FileManager.default.removeItem(atPath: kCursorDaemonReadyPath)
             let binPath = Bundle.main.executableURL?.path ?? CommandLine.arguments[0]
             let daemonTask = Process()
             daemonTask.executableURL = URL(fileURLWithPath: binPath)
@@ -872,15 +915,15 @@ struct VirtualCursorClient {
                 daemonTask.standardError = FileHandle.nullDevice
             }
             try? daemonTask.run()
-            // Wait up to 1.5s for daemon PID file / notification registration
-            for _ in 0..<30 {
-                if cursorDaemonPID() != nil {
-                    usleep(120_000)
+            // Wait up to 2.5s for daemon runloop & DistributedNotificationCenter registration
+            for _ in 0..<50 {
+                if let pid = cursorDaemonPID(), cursorDaemonReadyPID() == pid {
+                    usleep(30_000)
                     return
                 }
                 usleep(50_000)
             }
-            usleep(300_000)
+            usleep(200_000)
         }
     }
     
@@ -1688,8 +1731,11 @@ final class HoverPiPView: NSView {
 
     func mirrorCursorMoved(normalizedX: CGFloat, normalizedY: CGFloat, duration: Double) {
         guard dockSide == nil else { return }
-        let pBounds = previewLayer.bounds
+        let pBounds = (previewLayer.bounds.width > 0 && previewLayer.bounds.height > 0) ? previewLayer.bounds : previewRect
         guard pBounds.width > 0, pBounds.height > 0 else { return }
+        if previewLayer.frame != previewRect {
+            layoutSubtreeIfNeeded()
+        }
         let px = normalizedX * pBounds.width
         let py = (1.0 - normalizedY) * pBounds.height
 
@@ -1704,8 +1750,11 @@ final class HoverPiPView: NSView {
 
     func mirrorCursorClicked(normalizedX: CGFloat, normalizedY: CGFloat, button: String) {
         guard dockSide == nil else { return }
-        let pBounds = previewLayer.bounds
+        let pBounds = (previewLayer.bounds.width > 0 && previewLayer.bounds.height > 0) ? previewLayer.bounds : previewRect
         guard pBounds.width > 0, pBounds.height > 0 else { return }
+        if previewLayer.frame != previewRect {
+            layoutSubtreeIfNeeded()
+        }
         let px = normalizedX * pBounds.width
         let py = (1.0 - normalizedY) * pBounds.height
 
@@ -2817,6 +2866,7 @@ final class PiPWindowController: PiPInteractionDelegate {
         waitingForInitialFrame = (initial == nil)
         consecutiveCaptureFailures = 0
         panel.setFrame(frame, display: false)
+        view.layoutSubtreeIfNeeded()
         if hasValidPreview {
             try? "ready".write(toFile: pipReadyPath(for: Int(wid)), atomically: true, encoding: .utf8)
         }
@@ -3621,8 +3671,11 @@ class FancyCursorDaemon {
         
         setupActualCursorVisuals()
         registerNotifications()
-        
+        DispatchQueue.main.async {
+            try? "\(ProcessInfo.processInfo.processIdentifier)".write(toFile: kCursorDaemonReadyPath, atomically: true, encoding: .utf8)
+        }
         print("Compact Delta Cursor Daemon active (Strict host-app PiP & overlay containment enabled).")
+        fflush(stdout)
         app.run()
     }
 
@@ -3802,6 +3855,7 @@ class FancyCursorDaemon {
             case "stop":
                 self.pipManager?.hideAll()
                 try? FileManager.default.removeItem(atPath: kCursorDaemonPIDPath)
+                try? FileManager.default.removeItem(atPath: kCursorDaemonReadyPath)
                 exit(0)
             default:
                 break
@@ -5316,20 +5370,32 @@ func scrollWheel(dx: Int32, dy: Int32, at: CGPoint? = nil, targetPID: pid_t? = n
         fputs("\(err)\n", stderr)
         return (false, err)
     }
-    let resolvedWID = actionTarget.windowID
     let resolvedPID = actionTarget.pid
+    let resolvedWID: CGWindowID? = {
+        if let w = actionTarget.windowID { return w }
+        if let pid = resolvedPID, let w = firstWindowID(matchingPID: pid) { return w }
+        if let app = appName, let w = PiPWindowController.firstWindowID(matchingApp: app) { return w }
+        return nil
+    }()
+    let scrollPoint: CGPoint? = {
+        if let pt = at { return pt }
+        if let wid = resolvedWID, let b = BGInput.windowBounds(wid) {
+            return CGPoint(x: b.midX, y: b.midY)
+        }
+        return nil
+    }()
 
-    withAutoPiP(windowID: resolvedWID, appName: appName, pid: resolvedPID, point: at) {
-        if let loc = at {
+    withAutoPiP(windowID: resolvedWID, appName: appName, pid: resolvedPID, point: scrollPoint) {
+        if let loc = scrollPoint {
             VirtualCursorClient.move(to: loc, speed: "fast")
-            usleep(60000)
+            usleep(120_000)
         }
 
         var vBar: AXUIElement? = nil
         var hBar: AXUIElement? = nil
         var beforeV: Double? = nil
         var beforeH: Double? = nil
-        if let pid = resolvedPID, let scrollArea = findScrollArea(pid: pid, at: at) {
+        if let pid = resolvedPID, let scrollArea = findScrollArea(pid: pid, at: scrollPoint) {
             if let vb = getAttribute(scrollArea, kAXVerticalScrollBarAttribute) {
                 let el = vb as! AXUIElement
                 vBar = el
@@ -5344,14 +5410,14 @@ func scrollWheel(dx: Int32, dy: Int32, at: CGPoint? = nil, targetPID: pid_t? = n
 
         let event = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0)
         setTargetWindow(event, windowID: resolvedWID)
-        if let loc = at {
+        if let loc = scrollPoint {
             event?.location = loc
         }
         if let pid = resolvedPID, let event {
             // Wheel events are hit-tested at the point: stamp pid/window routing so backgrounded
-            // Chromium/WebKit scroll the element under `at` without focus.
-            let loc = at ?? event.location
-            let scrollWID = BGInput.windowFor(pid: pid, at: at) ?? resolvedWID
+            // Chromium/WebKit scroll the element under `scrollPoint` without focus.
+            let loc = scrollPoint ?? event.location
+            let scrollWID = BGInput.windowFor(pid: pid, at: scrollPoint) ?? resolvedWID
             BGInput.postMouse(.mouseMoved, at: loc, pid: pid, wid: scrollWID)
             BGInput.stampMouse(event, at: loc, pid: pid, wid: scrollWID, routingOnly: true)
             BGInput.post(event, pid: pid)
